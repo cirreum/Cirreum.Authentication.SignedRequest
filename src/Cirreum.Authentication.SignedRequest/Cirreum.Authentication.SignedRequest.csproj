@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<AssemblyName>Cirreum.Authentication.SignedRequest</AssemblyName>
+		<RootNamespace>Cirreum.Authentication.SignedRequest</RootNamespace>
+		<Description>SignedRequest authentication scheme for the Cirreum framework. Successor to Cirreum.Authorization.SignedRequest from the Cirreum 1.0 Foundation Reset, which recognizes Authentication as a first-class security pillar. Validates HMAC-SHA256 (and pluggable future algorithms) signed request envelopes for partner / M2M integrations. Ships the authentication handler, ISchemeSelector, client resolver family, and the version-keyed ISignedRequestAlgorithm resolver that's the prerequisite for RFC 9421 alignment.</Description>
+		<PackageTags>cirreum;authentication;signedrequest;hmac;rfc9421;scheme</PackageTags>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\..\..\..\Core\Cirreum.AuthenticationProvider\src\Cirreum.AuthenticationProvider\Cirreum.AuthenticationProvider.csproj" />
+
+		<PackageReference Include="Cirreum.Result" Version="1.0.16" />
+		<PackageReference Include="Cirreum.Providers" Version="1.2.0" />
+		<PackageReference Include="Microsoft.IO.RecyclableMemoryStream" Version="3.0.1" />
+
+		<FrameworkReference Include="Microsoft.AspNetCore.App" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<Using Include="Cirreum.Providers" />
+	</ItemGroup>
+
+	<ItemGroup Label="InternalsVisibleTo" Condition="'$(IsLocalBuild)' == 'true'">
+		<InternalsVisibleTo Include="Cirreum.Authentication.SignedRequest.Tests" />
+	</ItemGroup>
+
+</Project>
