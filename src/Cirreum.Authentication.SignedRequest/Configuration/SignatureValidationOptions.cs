@@ -51,4 +51,18 @@ public sealed class SignatureValidationOptions {
 	/// </summary>
 	public IReadOnlySet<string> SupportedSignatureVersions { get; set; } =
 		new HashSet<string> { "v1" };
+
+	/// <summary>
+	/// Gets or sets whether the strict-nonce replay posture is enforced. When <see langword="true"/>, each
+	/// signed request is single-use: after its signature is verified, the request's signature digest is
+	/// atomically claimed via an <c>IReplayGuard</c> so the same signed request cannot be replayed within the
+	/// timestamp-acceptance window. Default <see langword="false"/> (timestamp-window protection only — a
+	/// request can be replayed until the window lapses).
+	/// </summary>
+	/// <remarks>
+	/// Enabling this requires a coordination backend: call <c>auth.AddCoordination(c =&gt; c.UseInMemory())</c>
+	/// (single node) or <c>.UseRedis()</c> (multi-node). The host fails fast at startup if strict-nonce is
+	/// enabled without one. (ADR-0021.)
+	/// </remarks>
+	public bool RequireStrictNonce { get; set; } = false;
 }

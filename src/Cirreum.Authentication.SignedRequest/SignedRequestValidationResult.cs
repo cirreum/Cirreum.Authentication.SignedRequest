@@ -9,11 +9,13 @@ public sealed class SignedRequestValidationResult {
 		bool isSuccess,
 		SignedRequestClient? client,
 		string? failureReason,
-		SignatureFailureType failureType) {
+		SignatureFailureType failureType,
+		TimeSpan? replayWindow = null) {
 		this.IsSuccess = isSuccess;
 		this.Client = client;
 		this.FailureReason = failureReason;
 		this.FailureType = failureType;
+		this.ReplayWindow = replayWindow;
 	}
 
 	/// <summary>
@@ -37,10 +39,22 @@ public sealed class SignedRequestValidationResult {
 	public SignatureFailureType FailureType { get; }
 
 	/// <summary>
-	/// Creates a successful result with the authenticated client.
+	/// On a successful result, the window during which a replay of this exact request would still pass
+	/// timestamp validation — i.e. how long a strict-nonce claim must be held. This is the <em>effective</em>
+	/// (per-credential) tolerance the resolver applied, which may exceed the global default, so the replay
+	/// token never under-covers the accepted window. <see langword="null"/> when the resolver did not report
+	/// one (e.g. a custom resolver), in which case the handler falls back to the global tolerances.
 	/// </summary>
-	public static SignedRequestValidationResult Success(SignedRequestClient client) =>
-		new(true, client, null, SignatureFailureType.None);
+	public TimeSpan? ReplayWindow { get; }
+
+	/// <summary>
+	/// Creates a successful result with the authenticated client and the effective replay window
+	/// (the per-credential timestamp tolerance applied during validation). Pass the window whenever it is
+	/// known so strict-nonce sizing matches the accepted timestamp window; omit it to fall back to the
+	/// handler's global tolerances.
+	/// </summary>
+	public static SignedRequestValidationResult Success(SignedRequestClient client, TimeSpan? replayWindow = null) =>
+		new(true, client, null, SignatureFailureType.None, replayWindow);
 
 	/// <summary>
 	/// Creates a failure result indicating the client was not found.

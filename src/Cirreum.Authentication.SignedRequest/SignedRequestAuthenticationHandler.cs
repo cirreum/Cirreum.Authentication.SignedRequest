@@ -1,12 +1,16 @@
 namespace Cirreum.Authentication.SignedRequest;
 
 using Cirreum.Authentication.Configuration;
+using Cirreum.Coordination;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.IO;
 using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Encodings.Web;
 
 /// <summary>
@@ -124,6 +128,58 @@ public class SignedRequestAuthenticationHandler(
 
 		// 8. Build claims principal
 		var client = result.Client;
+
+		// 8a. Strict-nonce replay protection (ADR-0021): the signature is now proven valid, so atomically
+		//     claim its digest. The same signed request is single-use within the timestamp window; a replay
+		//     loses the claim and is rejected. All failure paths fail closed.
+		if (this._validationOptions.RequireStrictNonce) {
+			var replayGuard = this.Context.RequestServices.GetService<IReplayGuard>();
+
+			if (replayGuard is null) {
+				// Misconfiguration: strict-nonce is on but no coordination backend was chosen. The umbrella
+				// boot validator (CoordinationPostureValidator) should have failed startup; this is the
+				// request-time failsafe. Fail closed — never authenticate replay-exposed.
+				const string reason = "Replay protection is required but no coordination backend is registered";
+				await this.RaiseFailureEventAsync(clientId, SignatureFailureType.ReplayProtectionUnavailable, reason);
+				if (this.Logger.IsEnabled(LogLevel.Error)) {
+					this.Logger.LogError("Signed request rejected for client {ClientId}: {Reason}", clientId, reason);
+				}
+				return AuthenticateResult.Fail(reason);
+			}
+
+			// Hold the claim for exactly as long as a replay of this request would still pass timestamp
+			// validation. That is the effective (per-credential) tolerance the resolver applied — using the
+			// global default would under-cover a client granted a wider tolerance and re-open a replay window.
+			// Fall back to the global tolerances when the resolver did not report an effective window.
+			var ttl = result.ReplayWindow
+				?? (this._validationOptions.TimestampTolerance + this._validationOptions.FutureTimestampTolerance);
+			var token = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(signature!)));
+
+			bool claimed;
+			try {
+				claimed = await replayGuard.TryClaimAsync(token, ttl, this.Context.RequestAborted);
+			} catch (Exception ex) when (ex is not OperationCanceledException) {
+				// Backend unreachable (e.g. Redis down). Fail closed gracefully — a clean authentication
+				// failure rather than an unhandled 500 — logged and surfaced through the event sink so the
+				// outage stays observable. (Cancellation propagates: that is a normal client disconnect.)
+				const string reason = "Replay protection backend is unavailable";
+				await this.RaiseFailureEventAsync(clientId, SignatureFailureType.ReplayProtectionUnavailable, reason);
+				if (this.Logger.IsEnabled(LogLevel.Error)) {
+					this.Logger.LogError(ex, "Signed request rejected for client {ClientId}: {Reason}", clientId, reason);
+				}
+				return AuthenticateResult.Fail("Replay protection is temporarily unavailable");
+			}
+
+			if (!claimed) {
+				const string reason = "Replayed signed request";
+				await this.RaiseFailureEventAsync(clientId, SignatureFailureType.ReplayDetected, reason);
+				if (this.Logger.IsEnabled(LogLevel.Warning)) {
+					this.Logger.LogWarning("Signed request rejected for client {ClientId}: {Reason}", clientId, reason);
+				}
+				return AuthenticateResult.Fail(reason);
+			}
+		}
+
 		var claims = new List<Claim> {
 			new(ClaimTypes.NameIdentifier, client.ClientId),
 			new(ClaimTypes.Name, client.ClientName),

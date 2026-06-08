@@ -4,6 +4,7 @@ using Cirreum.Authentication.Configuration;
 using Cirreum.Authentication.SignedRequest;
 using Cirreum.AuthenticationProvider;
 using Cirreum.AuthenticationProvider.SignedRequest;
+using Cirreum.Coordination;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -64,6 +65,15 @@ public static class SignedRequestAuthenticationBuilderExtensions {
 		// initializers) apply when not configured; IOptions provides a default instance.
 		if (options.ValidationConfiguration is not null) {
 			services.Configure(options.ValidationConfiguration);
+		}
+
+		// Strict-nonce posture (ADR-0021) needs a coordination backend: pull the requirement so the umbrella's
+		// CoordinationPostureValidator fails the host fast at startup if the app never chooses one. Probe the
+		// configured options here (rather than reading bound IOptions) so it stays ordering-independent.
+		var validationProbe = new SignatureValidationOptions();
+		options.ValidationConfiguration?.Invoke(validationProbe);
+		if (validationProbe.RequireStrictNonce) {
+			services.AddCoordination();
 		}
 
 		// Supporting services — algorithm contracts (HMAC-SHA256 default + pluggable resolver),

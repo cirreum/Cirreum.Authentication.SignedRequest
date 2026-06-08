@@ -111,6 +111,11 @@ public abstract class DynamicSignedRequestClientResolver(
 
 		// 3. Try each credential until we find a match (supports key rotation)
 		StoredSigningCredential? matchedCredential = null;
+		// Effective tolerances of the matched credential — captured so the success result can report the
+		// replay window the handler must cover (strict-nonce). Per-credential overrides may exceed the global
+		// default, so sizing the nonce from the global value alone would re-open a replay window.
+		TimeSpan matchedTimestampTolerance = default;
+		TimeSpan matchedFutureTimestampTolerance = default;
 
 		foreach (var credential in credentials) {
 			// Skip inactive credentials
@@ -159,6 +164,8 @@ public abstract class DynamicSignedRequestClientResolver(
 			// Validate signature
 			if (this._validator.ValidateSignature(context, credential.SigningSecret)) {
 				matchedCredential = credential;
+				matchedTimestampTolerance = timestampTolerance;
+				matchedFutureTimestampTolerance = futureTimestampTolerance;
 				break;
 			}
 		}
@@ -195,7 +202,10 @@ public abstract class DynamicSignedRequestClientResolver(
 				matchedCredential.CredentialId);
 		}
 
-		return SignedRequestValidationResult.Success(client);
+		// Report the effective replay window (the per-credential tolerances actually applied) so strict-nonce
+		// holds the claim for exactly as long as a replay of this request would still pass timestamp validation.
+		var replayWindow = matchedTimestampTolerance + matchedFutureTimestampTolerance;
+		return SignedRequestValidationResult.Success(client, replayWindow);
 	}
 
 	/// <summary>
