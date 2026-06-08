@@ -43,7 +43,11 @@ public sealed class SignedRequestValidationResult {
 	/// timestamp validation — i.e. how long a strict-nonce claim must be held. This is the <em>effective</em>
 	/// (per-credential) tolerance the resolver applied, which may exceed the global default, so the replay
 	/// token never under-covers the accepted window. <see langword="null"/> when the resolver did not report
-	/// one (e.g. a custom resolver), in which case the handler falls back to the global tolerances.
+	/// one — the handler then falls back to the global <c>SignatureValidationOptions</c> tolerances. <b>A custom
+	/// resolver that accepts a timestamp window wider than those global tolerances and leaves this
+	/// <see langword="null"/> reopens a replay gap</b> (the claim under-covers its acceptance window), so such
+	/// resolvers must set this under strict-nonce. The shipped <see cref="DynamicSignedRequestClientResolver"/>
+	/// always sets it.
 	/// </summary>
 	public TimeSpan? ReplayWindow { get; }
 

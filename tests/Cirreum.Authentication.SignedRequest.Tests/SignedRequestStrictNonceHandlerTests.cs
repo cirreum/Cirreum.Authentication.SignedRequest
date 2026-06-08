@@ -169,6 +169,90 @@ public sealed class SignedRequestStrictNonceHandlerTests {
 		result.Succeeded.Should().BeTrue();
 	}
 
+	[Fact]
+	public async Task Cancellation_from_the_backend_propagates_and_is_not_swallowed_as_a_failure() {
+		var options = new SignatureValidationOptions { RequireStrictNonce = true };
+
+		// A cancelled claim is a normal client disconnect, NOT "backend unavailable": it must propagate out of
+		// the handler (the catch filter excludes OperationCanceledException) rather than become a clean 401.
+		var act = async () => await RunAsync(
+			options,
+			ResolverReturning(SuccessResult(TimeSpan.FromMinutes(5))),
+			RequestServicesWith(new CancellingReplayGuard()));
+
+		await act.Should().ThrowAsync<OperationCanceledException>();
+	}
+
+	[Fact]
+	public async Task End_to_end_real_resolver_validator_and_backend_enforce_single_use() {
+		const string secret = "super-secret-signing-key";
+		const string path = "/api/x";
+		var options = new SignatureValidationOptions { RequireStrictNonce = true };
+
+		// Real HMAC-SHA256 (v1) signature chain — no stub on the signing path.
+		var validator = new DefaultSignatureValidator(
+			Options.Create(options),
+			new LegacySignatureAlgorithmResolver([new HmacSha256SignatureAlgorithm()]));
+
+		// Sign the exact canonical the handler reconstructs: {ts}.{method}.{path}.{bodyHash}; GET => empty body.
+		var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+		var canonical = $"{timestamp}.GET.{path}.{DefaultSignatureValidator.EmptyStringHash}";
+		var signature = validator.ComputeSignature(canonical, secret);
+
+		var credential = new StoredSigningCredential {
+			CredentialId = "cred-1",
+			ClientId = "client-1",
+			ClientName = "Client One",
+			SigningSecret = secret,
+		};
+		var resolver = new RealResolver([credential], validator, Options.Create(options));
+		// Real in-memory coordination backend, shared across both presentations.
+		var provider = new ServiceCollection().AddCoordination(c => c.UseInMemory()).BuildServiceProvider();
+
+		var first = await PresentAsync(options, resolver, provider, timestamp, path, signature);
+		first.Succeeded.Should().BeTrue("a correctly signed request authenticates through the real path");
+
+		var second = await PresentAsync(options, resolver, provider, timestamp, path, signature);
+		second.Succeeded.Should().BeFalse("the identical signed request is single-use under strict-nonce");
+		second.Failure!.Message.Should().Contain("Replayed");
+	}
+
+	// Builds the handler with caller-controlled timestamp/path/signature (RunAsync hardcodes those, which the
+	// end-to-end test cannot use because it must sign the exact canonical the handler will reconstruct).
+	private static async Task<AuthenticateResult> PresentAsync(
+		SignatureValidationOptions options,
+		ISignedRequestClientResolver resolver,
+		IServiceProvider requestServices,
+		long timestamp,
+		string path,
+		string signature) {
+
+		var optionsMonitor = Substitute.For<IOptionsMonitor<SignedRequestAuthenticationOptions>>();
+		optionsMonitor.Get(Arg.Any<string>()).Returns(new SignedRequestAuthenticationOptions());
+
+		var handler = new SignedRequestAuthenticationHandler(
+			optionsMonitor,
+			NullLoggerFactory.Instance,
+			UrlEncoder.Default,
+			resolver,
+			Substitute.For<ISignatureValidator>(), // the resolver owns signature validation; the handler's is unused for GET
+			Options.Create(options),
+			new RecyclableMemoryStreamManager(),
+			Substitute.For<ISignatureValidationEvents>());
+
+		var context = new DefaultHttpContext { RequestServices = requestServices };
+		context.Request.Method = "GET";
+		context.Request.Path = path;
+		context.Request.Headers["X-Client-Id"] = "client-1";
+		context.Request.Headers["X-Signature"] = signature;
+		context.Request.Headers["X-Timestamp"] = timestamp.ToString();
+
+		var scheme = new AuthenticationScheme(
+			SignedRequestSchemes.Default, SignedRequestSchemes.Default, typeof(SignedRequestAuthenticationHandler));
+		await handler.InitializeAsync(scheme, context);
+		return await handler.AuthenticateAsync();
+	}
+
 	// Captures the TTL the handler hands the backend, so a test can prove it matches the effective window.
 	private sealed class CapturingReplayGuard : IReplayGuard {
 		public TimeSpan? CapturedTtl { get; private set; }
@@ -182,6 +266,23 @@ public sealed class SignedRequestStrictNonceHandlerTests {
 	private sealed class ThrowingReplayGuard : IReplayGuard {
 		public ValueTask<bool> TryClaimAsync(string token, TimeSpan ttl, CancellationToken cancellationToken = default) =>
 			throw new InvalidOperationException("coordination backend unavailable");
+	}
+
+	// Simulates a client disconnect mid-claim (RequestAborted fired).
+	private sealed class CancellingReplayGuard : IReplayGuard {
+		public ValueTask<bool> TryClaimAsync(string token, TimeSpan ttl, CancellationToken cancellationToken = default) =>
+			throw new OperationCanceledException();
+	}
+
+	// A real DynamicSignedRequestClientResolver over an in-memory credential set, for the end-to-end test.
+	private sealed class RealResolver(
+		IEnumerable<StoredSigningCredential> credentials,
+		ISignatureValidator validator,
+		IOptions<SignatureValidationOptions> options)
+		: DynamicSignedRequestClientResolver(validator, options, NullLogger.Instance) {
+
+		protected override Task<IEnumerable<StoredSigningCredential>> LookupCredentialsAsync(
+			string clientId, CancellationToken cancellationToken) => Task.FromResult(credentials);
 	}
 
 }

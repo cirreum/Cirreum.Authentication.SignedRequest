@@ -47,6 +47,10 @@ public class SignedRequestAuthenticationHandler(
 	private readonly SignatureValidationOptions _validationOptions = validationOptions?.Value ?? new SignatureValidationOptions();
 	private readonly RecyclableMemoryStreamManager _streamManager = streamManager;
 
+	// Process-wide one-shot guard so the strict-nonce "resolver reported no replay window" advisory is logged
+	// at most once (the handler is transient — a new instance per request).
+	private static int _warnedNullReplayWindow;
+
 	/// <inheritdoc/>
 	protected override async Task<AuthenticateResult> HandleAuthenticateAsync() {
 
@@ -151,6 +155,21 @@ public class SignedRequestAuthenticationHandler(
 			// validation. That is the effective (per-credential) tolerance the resolver applied — using the
 			// global default would under-cover a client granted a wider tolerance and re-open a replay window.
 			// Fall back to the global tolerances when the resolver did not report an effective window.
+			if (result.ReplayWindow is null
+				&& this.Logger.IsEnabled(LogLevel.Warning)
+				&& System.Threading.Interlocked.CompareExchange(ref _warnedNullReplayWindow, 1, 0) == 0) {
+				// The shipped DynamicSignedRequestClientResolver always reports the window. A custom resolver that
+				// withholds it forces this global fallback — safe only if that resolver also validates within the
+				// global tolerances. If it accepts a WIDER per-credential window, the nonce under-covers it and a
+				// replay gap reopens; the handler cannot detect that, so warn once. (ADR-0021.)
+				this.Logger.LogWarning(
+					"Strict-nonce is enabled but the signed-request resolver returned no effective replay window; " +
+					"the nonce TTL is sized from the global timestamp tolerances. A custom {Resolver} that accepts a " +
+					"timestamp window wider than the global SignatureValidationOptions must report it via " +
+					"SignedRequestValidationResult.ReplayWindow, or a replay gap reopens. (Logged once.)",
+					nameof(ISignedRequestClientResolver));
+			}
+
 			var ttl = result.ReplayWindow
 				?? (this._validationOptions.TimestampTolerance + this._validationOptions.FutureTimestampTolerance);
 			var token = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(signature!)));
