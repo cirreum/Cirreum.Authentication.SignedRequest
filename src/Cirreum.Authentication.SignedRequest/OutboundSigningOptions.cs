@@ -43,8 +43,22 @@ public sealed class OutboundSigningOptions {
 	/// <summary>Whether to emit a random <c>nonce</c> parameter (required by the verifier's strict-nonce posture). Default <see langword="true"/>.</summary>
 	public bool IncludeNonce { get; set; } = true;
 
-	/// <summary>The number of random bytes in the generated nonce. Default 16 (128-bit).</summary>
-	public int NonceBytes { get; set; } = 16;
+	/// <summary>The minimum nonce size in bytes (128-bit) accepted for <see cref="NonceBytes"/>.</summary>
+	public const int MinimumNonceBytes = 16;
+
+	private int _nonceBytes = MinimumNonceBytes;
+
+	/// <summary>
+	/// The number of cryptographically-random bytes in the generated nonce. Default 16 (128-bit). Must be at
+	/// least <see cref="MinimumNonceBytes"/> — a nonce below 128 bits cannot give meaningful replay protection,
+	/// so a smaller value is rejected rather than silently emitting a weak nonce the verifier would refuse.
+	/// </summary>
+	public int NonceBytes {
+		get => this._nonceBytes;
+		set => this._nonceBytes = value >= MinimumNonceBytes
+			? value
+			: throw new ArgumentOutOfRangeException(nameof(value), value, $"NonceBytes must be at least {MinimumNonceBytes} (128-bit).");
+	}
 
 	/// <summary>The optional explicit audience (<c>tag</c>) — required only when the credential is bound to one.</summary>
 	public string? Tag { get; set; }

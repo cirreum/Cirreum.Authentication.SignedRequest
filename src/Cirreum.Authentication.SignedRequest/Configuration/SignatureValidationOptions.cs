@@ -51,7 +51,8 @@ public sealed class SignatureValidationOptions {
 
 	/// <summary>
 	/// Gets or sets the minimum length (in characters) of the <c>nonce</c> parameter accepted under the
-	/// strict-nonce posture. Default 22 (≈ a 128-bit value in base64url). A shorter nonce is rejected as
+	/// strict-nonce posture. Default 22 (≈ 128 bits at base64 density; the framework client emits a 24-char
+	/// standard-base64 nonce, above this floor). A shorter nonce is rejected as
 	/// <see cref="SignedRequest.SignatureFailureType.WeakNonce"/> — the server cannot trust the client to
 	/// supply sufficient entropy, so it enforces a floor.
 	/// </summary>

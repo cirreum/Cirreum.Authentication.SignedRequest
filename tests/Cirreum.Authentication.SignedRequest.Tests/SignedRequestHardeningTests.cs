@@ -139,4 +139,13 @@ public sealed class SignedRequestHardeningTests {
 		credential.ToString().Should().NotContain("super-secret-signing-key").And.Contain("[redacted]");
 	}
 
+	// --- ⑦ The outbound signer's NonceBytes floor (parity with the client SDK). ---
+
+	[Fact]
+	public void OutboundSigningOptions_NonceBytes_below_128_bit_is_rejected() {
+		var act = () => new OutboundSigningOptions { NonceBytes = 8 };
+
+		act.Should().Throw<ArgumentOutOfRangeException>();
+	}
+
 }
