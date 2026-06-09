@@ -9,7 +9,7 @@
 
 	<ItemGroup>
 		<!-- Cirreum.Result + Cirreum.Providers (+ Kernel/Contracts) flow in transitively via Cirreum.AuthenticationProvider. -->
-		<PackageReference Include="Cirreum.AuthenticationProvider" Version="1.2.0" />
+		<PackageReference Include="Cirreum.AuthenticationProvider" Version="1.3.0" />
 
 		<!-- Strict-nonce posture consumes IReplayGuard from the neutral coordination primitive. -->
 		<PackageReference Include="Cirreum.Coordination" Version="1.0.0" />

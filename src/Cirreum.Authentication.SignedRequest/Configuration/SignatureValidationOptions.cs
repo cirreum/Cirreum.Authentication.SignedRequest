@@ -1,63 +1,46 @@
 namespace Cirreum.Authentication.Configuration;
 
+using Cirreum.AuthenticationProvider.SignedRequest;
+
 /// <summary>
-/// Options for configuring signature validation behavior.
+/// Options for configuring RFC 9421 signed-request validation behavior.
 /// </summary>
 public sealed class SignatureValidationOptions {
 
 	/// <summary>
-	/// Gets or sets the maximum age of a request timestamp before it's rejected.
-	/// Default is 2 minutes.
+	/// Gets or sets the maximum age of a signature's <c>created</c> time before it is rejected. Default 2 minutes.
 	/// </summary>
 	/// <remarks>
-	/// This provides replay protection. Set higher if partners have clock skew issues,
-	/// but balance against security (longer windows = more replay opportunity).
+	/// Combined with <see cref="FutureTimestampTolerance"/> this is the freshness window; under the strict-nonce
+	/// posture the replay nonce is held for exactly this window. Longer windows ease clock skew but widen the
+	/// replay exposure of the <c>Baseline</c> (no-nonce) posture.
 	/// </remarks>
 	public TimeSpan TimestampTolerance { get; set; } = TimeSpan.FromMinutes(2);
 
 	/// <summary>
-	/// Gets or sets whether to allow future timestamps (clock skew in the other direction).
-	/// Default is true with a 30 second window.
+	/// Gets or sets how far a signature's <c>created</c> time may be in the future (client clock ahead of
+	/// the server). Default 30 seconds.
 	/// </summary>
 	public TimeSpan FutureTimestampTolerance { get; set; } = TimeSpan.FromSeconds(30);
 
 	/// <summary>
-	/// Gets or sets the header name for the client ID.
-	/// Default is "X-Client-Id".
+	/// Gets or sets the covered components a signature MUST include; a signature whose <c>Signature-Input</c>
+	/// omits any of these is rejected. Default <c>@method</c>, <c>@path</c>, <c>@query</c>, <c>content-digest</c>
+	/// (host-independent — <c>@authority</c> is intentionally not covered, per ADR-0021).
 	/// </summary>
-	public string ClientIdHeaderName { get; set; } = "X-Client-Id";
+	public IReadOnlyList<string> RequiredCoveredComponents { get; set; } = [
+		SignatureComponentNames.Method,
+		SignatureComponentNames.Path,
+		SignatureComponentNames.Query,
+		SignatureComponentNames.ContentDigest,
+	];
 
 	/// <summary>
-	/// Gets or sets the header name for the signature.
-	/// Default is "X-Signature".
-	/// </summary>
-	public string SignatureHeaderName { get; set; } = "X-Signature";
-
-	/// <summary>
-	/// Gets or sets the header name for the timestamp.
-	/// Default is "X-Timestamp".
-	/// </summary>
-	public string TimestampHeaderName { get; set; } = "X-Timestamp";
-
-	/// <summary>
-	/// Gets or sets whether to include query string in signature computation.
-	/// Default is true for security.
-	/// </summary>
-	public bool IncludeQueryString { get; set; } = true;
-
-	/// <summary>
-	/// Gets or sets the supported signature versions.
-	/// Default is ["v1"]. Add new versions when upgrading algorithms.
-	/// </summary>
-	public IReadOnlySet<string> SupportedSignatureVersions { get; set; } =
-		new HashSet<string> { "v1" };
-
-	/// <summary>
-	/// Gets or sets whether the strict-nonce replay posture is enforced. When <see langword="true"/>, each
-	/// signed request is single-use: after its signature is verified, the request's signature digest is
-	/// atomically claimed via an <c>IReplayGuard</c> so the same signed request cannot be replayed within the
-	/// timestamp-acceptance window. Default <see langword="false"/> (timestamp-window protection only — a
-	/// request can be replayed until the window lapses).
+	/// Gets or sets whether the strict-nonce replay posture is enforced. When <see langword="true"/>, every
+	/// signed request must carry a <c>nonce</c> parameter which is atomically claimed via an <c>IReplayGuard</c>
+	/// after the signature verifies, so the same signed request cannot be replayed within the freshness window.
+	/// Default <see langword="false"/> (freshness-window protection only — a request can be replayed until the
+	/// window lapses).
 	/// </summary>
 	/// <remarks>
 	/// Enabling this requires a coordination backend: call <c>auth.AddCoordination(c =&gt; c.UseInMemory())</c>
@@ -65,4 +48,12 @@ public sealed class SignatureValidationOptions {
 	/// enabled without one. (ADR-0021.)
 	/// </remarks>
 	public bool RequireStrictNonce { get; set; } = false;
+
+	/// <summary>
+	/// Gets or sets the minimum length (in characters) of the <c>nonce</c> parameter accepted under the
+	/// strict-nonce posture. Default 22 (≈ a 128-bit value in base64url). A shorter nonce is rejected as
+	/// <see cref="SignedRequest.SignatureFailureType.WeakNonce"/> — the server cannot trust the client to
+	/// supply sufficient entropy, so it enforces a floor.
+	/// </summary>
+	public int MinimumNonceLength { get; set; } = 22;
 }

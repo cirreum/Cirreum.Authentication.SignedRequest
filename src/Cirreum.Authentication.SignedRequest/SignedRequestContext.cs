@@ -1,93 +1,33 @@
 namespace Cirreum.Authentication.SignedRequest;
 
 /// <summary>
-/// Provides context for signed request validation, including all data needed
-/// to verify the request signature.
+/// The data an <see cref="ISignedRequestClientResolver"/> needs to verify one parsed RFC 9421 signature:
+/// the key identifier, algorithm, the already-built signature base, the signature bytes, and the freshness /
+/// audience parameters. The handler builds the signature base once (it is request-invariant across a client's
+/// credentials) via the shared <c>SignatureBaseBuilder</c> and passes it here, so the resolver only resolves
+/// the algorithm, applies per-credential freshness, and verifies the signature.
 /// </summary>
-/// <remarks>
-/// Initializes a new instance of the <see cref="SignedRequestContext"/> class.
-/// </remarks>
-public sealed class SignedRequestContext(
-	string clientId,
-	string signature,
-	long timestamp,
-	string httpMethod,
-	string path,
-	string? bodyHash,
-	IReadOnlyDictionary<string, string> headers) {
+public sealed class SignedRequestContext {
 
-	/// <summary>
-	/// Gets the client ID from the X-Client-Id header.
-	/// </summary>
-	public string ClientId { get; } = clientId;
+	/// <summary>The <c>keyid</c> parameter — selects the presenting client's credential(s).</summary>
+	public required string KeyId { get; init; }
 
-	/// <summary>
-	/// Gets the signature value from the X-Signature header.
-	/// Expected format: "v1=hexstring" where v1 indicates the signature version.
-	/// </summary>
-	public string Signature { get; } = signature;
+	/// <summary>The <c>alg</c> parameter — the RFC 9421 algorithm identifier (e.g. <c>hmac-sha256</c>).</summary>
+	public required string Algorithm { get; init; }
 
-	/// <summary>
-	/// Gets the Unix timestamp from the X-Timestamp header.
-	/// </summary>
-	public long Timestamp { get; } = timestamp;
+	/// <summary>The RFC 9421 signature base bytes the signature is verified against.</summary>
+	public required ReadOnlyMemory<byte> SignatureBase { get; init; }
 
-	/// <summary>
-	/// Gets the HTTP method (GET, POST, etc.).
-	/// </summary>
-	public string HttpMethod { get; } = httpMethod;
+	/// <summary>The decoded signature bytes from the request's <c>Signature</c> header.</summary>
+	public required ReadOnlyMemory<byte> Signature { get; init; }
 
-	/// <summary>
-	/// Gets the request path (e.g., "/api/transactions").
-	/// </summary>
-	public string Path { get; } = path;
+	/// <summary>The <c>created</c> parameter (Unix seconds) — the signature creation time.</summary>
+	public required long Created { get; init; }
 
-	/// <summary>
-	/// Gets the SHA256 hash of the request body, or null for bodyless requests.
-	/// </summary>
-	public string? BodyHash { get; } = bodyHash;
+	/// <summary>The optional <c>expires</c> parameter (Unix seconds) — the signature's hard expiry.</summary>
+	public long? Expires { get; init; }
 
-	/// <summary>
-	/// Gets additional request headers for reference.
-	/// </summary>
-	public IReadOnlyDictionary<string, string> Headers { get; } = headers;
+	/// <summary>The optional <c>tag</c> parameter — an explicit audience/context binding.</summary>
+	public string? Tag { get; init; }
 
-	/// <summary>
-	/// Gets the timestamp as a DateTimeOffset.
-	/// </summary>
-	public DateTimeOffset TimestampAsDateTime =>
-		DateTimeOffset.FromUnixTimeSeconds(this.Timestamp);
-
-	/// <summary>
-	/// Builds the canonical request string that should be signed.
-	/// </summary>
-	/// <returns>The canonical string: "{timestamp}.{method}.{path}.{bodyHash}"</returns>
-	public string BuildCanonicalRequest() {
-		var body = this.BodyHash ?? DefaultSignatureValidator.EmptyStringHash;
-		return $"{this.Timestamp}.{this.HttpMethod}.{this.Path}.{body}";
-	}
-
-	/// <summary>
-	/// Parses the signature version from the signature header value.
-	/// </summary>
-	/// <returns>The version string (e.g., "v1") or null if invalid format.</returns>
-	public string? GetSignatureVersion() {
-		var eqIndex = this.Signature.IndexOf('=');
-		if (eqIndex <= 0) {
-			return null;
-		}
-		return this.Signature[..eqIndex];
-	}
-
-	/// <summary>
-	/// Gets the signature value without the version prefix.
-	/// </summary>
-	/// <returns>The hex-encoded signature or null if invalid format.</returns>
-	public string? GetSignatureValue() {
-		var eqIndex = this.Signature.IndexOf('=');
-		if (eqIndex < 0 || eqIndex >= this.Signature.Length - 1) {
-			return null;
-		}
-		return this.Signature[(eqIndex + 1)..];
-	}
 }

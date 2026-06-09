@@ -1,120 +1,108 @@
 namespace System.Net.Http;
 
+using Cirreum.Authentication.SignedRequest;
+using Cirreum.AuthenticationProvider.SignedRequest;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using Cirreum.Authentication.SignedRequest;
 
 /// <summary>
-/// Extension methods for signing outbound HTTP requests with HMAC signatures.
-/// Use these extensions when sending webhooks or service-to-service requests.
+/// Extension methods for signing outbound HTTP requests as RFC 9421 HTTP Message Signatures (RFC 9530
+/// <c>Content-Digest</c> for the body). Use when sending webhooks or service-to-service requests. The signing
+/// base is built with the shared <c>SignatureBaseBuilder</c> (ADR-0021 §8), so an outbound-signed request
+/// verifies byte-identically on the server.
 /// </summary>
 public static class HttpRequestMessageSigningExtensions {
 
 	/// <summary>
-	/// SHA256 hash of an empty string. Used for requests without a body.
-	/// </summary>
-	public const string EmptyBodyHash =
-		"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-	/// <summary>
-	/// Default header name for the client ID.
-	/// </summary>
-	public const string DefaultClientIdHeader = "X-Client-Id";
-
-	/// <summary>
-	/// Default header name for the timestamp.
-	/// </summary>
-	public const string DefaultTimestampHeader = "X-Timestamp";
-
-	/// <summary>
-	/// Default header name for the signature.
-	/// </summary>
-	public const string DefaultSignatureHeader = "X-Signature";
-
-	/// <summary>
-	/// Signs the request by adding X-Client-Id, X-Timestamp, and X-Signature headers.
+	/// Signs the request, adding <c>Content-Digest</c>, <c>Signature-Input</c>, and <c>Signature</c> headers.
 	/// </summary>
 	/// <param name="request">The HTTP request to sign.</param>
-	/// <param name="clientId">The public client identifier.</param>
-	/// <param name="signingSecret">The secret key used for HMAC signature.</param>
+	/// <param name="keyId">The credential identifier (<c>keyid</c>) the verifier resolves the secret by.</param>
+	/// <param name="signingSecret">The shared secret for the HMAC signature.</param>
 	/// <param name="options">Optional signing options.</param>
 	/// <param name="cancellationToken">Cancellation token.</param>
-	/// <returns>The request for chaining.</returns>
+	/// <returns>The request, for chaining.</returns>
 	public static async Task<HttpRequestMessage> SignRequestAsync(
 		this HttpRequestMessage request,
-		string clientId,
+		string keyId,
 		string signingSecret,
 		OutboundSigningOptions? options = null,
 		CancellationToken cancellationToken = default) {
 
 		ArgumentNullException.ThrowIfNull(request);
-		ArgumentException.ThrowIfNullOrWhiteSpace(clientId);
+		ArgumentException.ThrowIfNullOrWhiteSpace(keyId);
 		ArgumentException.ThrowIfNullOrWhiteSpace(signingSecret);
 
 		options ??= OutboundSigningOptions.Default;
 
-		var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-		var bodyHash = await ComputeBodyHashAsync(request.Content, cancellationToken).ConfigureAwait(false);
-		var path = GetRequestPath(request.RequestUri, options.IncludeQueryString);
-		var method = request.Method.Method.ToUpperInvariant();
+		var algorithm = ResolveAlgorithm(options.Algorithm);
 
-		var canonicalRequest = $"{timestamp}.{method}.{path}.{bodyHash}";
-		var signature = ComputeSignature(canonicalRequest, signingSecret, options.SignatureVersion);
+		var body = request.Content is null
+			? []
+			: await request.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
+		var contentDigest = ContentDigest.Compute(body);
 
-		request.Headers.Remove(options.ClientIdHeaderName);
-		request.Headers.Remove(options.TimestampHeaderName);
-		request.Headers.Remove(options.SignatureHeaderName);
+		var (path, query) = GetPathAndQuery(request.RequestUri);
+		var components = SignatureBaseComponents.FromRequest(
+			request.Method.Method,
+			path,
+			query,
+			[new KeyValuePair<string, string>(SignatureComponentNames.ContentDigest, contentDigest)]);
 
-		request.Headers.TryAddWithoutValidation(options.ClientIdHeaderName, clientId);
-		request.Headers.TryAddWithoutValidation(options.TimestampHeaderName, timestamp.ToString());
-		request.Headers.TryAddWithoutValidation(options.SignatureHeaderName, signature);
+		var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+		long? expires = options.ExpiresAfter is { } window ? created + (long)window.TotalSeconds : null;
+		var nonce = options.IncludeNonce
+			? Convert.ToBase64String(RandomNumberGenerator.GetBytes(options.NonceBytes))
+			: null;
+
+		var parameters = new SignatureParameters {
+			CoveredComponents = options.CoveredComponents,
+			KeyId = keyId,
+			Algorithm = options.Algorithm,
+			Created = created,
+			Expires = expires,
+			Nonce = nonce,
+			Tag = options.Tag,
+		};
+
+		var result = SignatureBaseBuilder.BuildForSigning(components, parameters);
+		var signatureBytes = algorithm.Sign(result.SignatureBase, Encoding.UTF8.GetBytes(signingSecret));
+
+		request.Headers.Remove(SignedRequestDefaults.ContentDigestHeader);
+		request.Headers.Remove(SignedRequestDefaults.SignatureInputHeader);
+		request.Headers.Remove(SignedRequestDefaults.SignatureHeader);
+
+		request.Headers.TryAddWithoutValidation(SignedRequestDefaults.ContentDigestHeader, contentDigest);
+		request.Headers.TryAddWithoutValidation(
+			SignedRequestDefaults.SignatureInputHeader, $"{options.SignatureLabel}={result.SignatureParamsValue}");
+		request.Headers.TryAddWithoutValidation(
+			SignedRequestDefaults.SignatureHeader, $"{options.SignatureLabel}=:{Convert.ToBase64String(signatureBytes)}:");
 
 		return request;
 	}
 
-	/// <summary>
-	/// Sends a signed HTTP request.
-	/// </summary>
-	/// <param name="client">The HTTP client.</param>
-	/// <param name="request">The request to sign and send.</param>
-	/// <param name="clientId">The public client identifier.</param>
-	/// <param name="signingSecret">The secret key used for HMAC signature.</param>
-	/// <param name="options">Optional signing options.</param>
-	/// <param name="cancellationToken">Cancellation token.</param>
-	/// <returns>The HTTP response.</returns>
+	/// <summary>Signs and sends a request.</summary>
 	public static async Task<HttpResponseMessage> SendSignedAsync(
 		this HttpClient client,
 		HttpRequestMessage request,
-		string clientId,
+		string keyId,
 		string signingSecret,
 		OutboundSigningOptions? options = null,
 		CancellationToken cancellationToken = default) {
 
 		ArgumentNullException.ThrowIfNull(client);
 
-		await request.SignRequestAsync(clientId, signingSecret, options, cancellationToken).ConfigureAwait(false);
+		await request.SignRequestAsync(keyId, signingSecret, options, cancellationToken).ConfigureAwait(false);
 		return await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
 	}
 
-	/// <summary>
-	/// Sends a signed HTTP request with JSON content.
-	/// </summary>
-	/// <typeparam name="TContent">The type of the request body.</typeparam>
-	/// <param name="client">The HTTP client.</param>
-	/// <param name="method">The HTTP method.</param>
-	/// <param name="requestUri">The request URI.</param>
-	/// <param name="clientId">The public client identifier.</param>
-	/// <param name="signingSecret">The secret key used for HMAC signature.</param>
-	/// <param name="content">The request body (will be serialized to JSON).</param>
-	/// <param name="options">Optional signing options.</param>
-	/// <param name="cancellationToken">Cancellation token.</param>
-	/// <returns>The HTTP response.</returns>
+	/// <summary>Signs and sends a request with a JSON body.</summary>
 	public static Task<HttpResponseMessage> SendSignedAsync<TContent>(
 		this HttpClient client,
 		HttpMethod method,
 		string requestUri,
-		string clientId,
+		string keyId,
 		string signingSecret,
 		TContent? content = default,
 		OutboundSigningOptions? options = null,
@@ -125,71 +113,31 @@ public static class HttpRequestMessageSigningExtensions {
 		var request = new HttpRequestMessage(method, requestUri);
 
 		if (content is not null) {
-			var json = JsonSerializer.Serialize(content, options?.JsonSerializerOptions ?? OutboundSigningOptions.DefaultJsonOptions);
+			var json = JsonSerializer.Serialize(
+				content, options?.JsonSerializerOptions ?? OutboundSigningOptions.DefaultJsonOptions);
 			request.Content = new StringContent(json, Encoding.UTF8, "application/json");
 		}
 
-		return client.SendSignedAsync(request, clientId, signingSecret, options, cancellationToken);
+		return client.SendSignedAsync(request, keyId, signingSecret, options, cancellationToken);
 	}
 
-	private static async Task<string> ComputeBodyHashAsync(HttpContent? content, CancellationToken cancellationToken) {
-		if (content is null) {
-			return EmptyBodyHash;
-		}
+	private static ISignedRequestAlgorithm ResolveAlgorithm(string algorithmId) =>
+		string.Equals(algorithmId, HmacSha256SignedRequestAlgorithm.Id, StringComparison.Ordinal)
+			? new HmacSha256SignedRequestAlgorithm()
+			: throw new NotSupportedException(
+				$"Outbound signing algorithm '{algorithmId}' is not supported (v1 ships hmac-sha256).");
 
-		var bytes = await content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
-
-		if (bytes.Length == 0) {
-			return EmptyBodyHash;
-		}
-
-		Span<byte> hash = stackalloc byte[SHA256.HashSizeInBytes];
-		SHA256.HashData(bytes, hash);
-		return Convert.ToHexString(hash).ToLowerInvariant();
-	}
-
-	private static string GetRequestPath(Uri? uri, bool includeQueryString) {
+	private static (string Path, string Query) GetPathAndQuery(Uri? uri) {
 		if (uri is null) {
-			return "/";
+			return ("/", string.Empty);
 		}
-
-		string path;
-		string query;
 
 		if (uri.IsAbsoluteUri) {
-			path = uri.AbsolutePath;
-			query = uri.Query;
-		} else {
-			var originalString = uri.OriginalString;
-			var queryIndex = originalString.IndexOf('?');
-			if (queryIndex >= 0) {
-				path = originalString[..queryIndex];
-				query = originalString[queryIndex..];
-			} else {
-				path = originalString;
-				query = string.Empty;
-			}
+			return (uri.AbsolutePath, uri.Query);
 		}
 
-		if (string.IsNullOrEmpty(path)) {
-			path = "/";
-		}
-
-		if (includeQueryString && !string.IsNullOrEmpty(query)) {
-			path += query;
-		}
-
-		return path;
-	}
-
-	private static string ComputeSignature(string canonicalRequest, string signingSecret, string version) {
-		var keyBytes = Encoding.UTF8.GetBytes(signingSecret);
-		var messageBytes = Encoding.UTF8.GetBytes(canonicalRequest);
-
-		Span<byte> hmac = stackalloc byte[HMACSHA256.HashSizeInBytes];
-		HMACSHA256.HashData(keyBytes, messageBytes, hmac);
-		var signatureValue = Convert.ToHexString(hmac).ToLowerInvariant();
-
-		return $"{version}={signatureValue}";
+		var original = uri.OriginalString;
+		var queryIndex = original.IndexOf('?');
+		return queryIndex >= 0 ? (original[..queryIndex], original[queryIndex..]) : (original, string.Empty);
 	}
 }

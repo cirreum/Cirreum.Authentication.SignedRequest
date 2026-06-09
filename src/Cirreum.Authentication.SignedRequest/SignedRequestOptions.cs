@@ -13,8 +13,8 @@ public sealed class SignedRequestOptions {
 	internal Action<SignatureValidationOptions>? ValidationConfiguration { get; private set; }
 
 	/// <summary>
-	/// Configures signature-validation behavior (timestamp tolerance, header names, supported
-	/// signature versions, etc.). Apps that want config-driven tuning bind their own
+	/// Configures signature-validation behavior (timestamp tolerance, required covered components,
+	/// strict-nonce posture, etc.). Apps that want config-driven tuning bind their own
 	/// configuration here — e.g. <c>o.ConfigureValidation(v =&gt; v.TimestampTolerance = cfg...)</c>.
 	/// </summary>
 	/// <param name="configure">The configuration action.</param>

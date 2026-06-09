@@ -108,4 +108,10 @@ public sealed class SignedRequestValidationResult {
 	public static SignedRequestValidationResult Failed(string reason) =>
 		new(false, null, reason, SignatureFailureType.Other);
 
+	/// <summary>
+	/// Creates a failure result of the given <paramref name="failureType"/> with a custom reason.
+	/// </summary>
+	public static SignedRequestValidationResult Fail(SignatureFailureType failureType, string reason) =>
+		new(false, null, reason, failureType);
+
 }

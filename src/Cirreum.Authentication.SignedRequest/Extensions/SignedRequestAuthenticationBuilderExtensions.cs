@@ -76,13 +76,10 @@ public static class SignedRequestAuthenticationBuilderExtensions {
 			services.AddCoordination();
 		}
 
-		// Supporting services — algorithm contracts (HMAC-SHA256 default + pluggable resolver),
-		// the validator, body-hash stream manager, and the no-op event sink.
+		// Supporting services — RFC 9421 algorithm contracts (HMAC-SHA256 default + pluggable resolver),
+		// the body-buffering stream manager (for Content-Digest verification), and the no-op event sink.
 		services.TryAddSingleton<ISignedRequestAlgorithm, HmacSha256SignedRequestAlgorithm>();
 		services.TryAddSingleton<ISignedRequestAlgorithmResolver, SignedRequestAlgorithmResolver>();
-		services.TryAddSingleton<ILegacySignatureAlgorithm, HmacSha256SignatureAlgorithm>();
-		services.TryAddSingleton<ILegacySignatureAlgorithmResolver, LegacySignatureAlgorithmResolver>();
-		services.TryAddSingleton<ISignatureValidator, DefaultSignatureValidator>();
 		services.TryAddSingleton<RecyclableMemoryStreamManager>();
 		services.TryAddSingleton<ISignatureValidationEvents>(_ => NullSignatureValidationEvents.Instance);
 
@@ -96,10 +93,7 @@ public static class SignedRequestAuthenticationBuilderExtensions {
 		builder.AuthBuilder.AddScheme<SignedRequestAuthenticationOptions, SignedRequestAuthenticationHandler>(
 			schemeName,
 			_ => { });
-		services.AddSingleton(sp =>
-			new SignedRequestAuthenticationSchemeSelector(
-				schemeName,
-				sp.GetRequiredService<IOptions<SignatureValidationOptions>>()));
+		services.AddSingleton(new SignedRequestAuthenticationSchemeSelector(schemeName));
 		services.AddSingleton<ISchemeSelector>(sp =>
 			sp.GetRequiredService<SignedRequestAuthenticationSchemeSelector>());
 

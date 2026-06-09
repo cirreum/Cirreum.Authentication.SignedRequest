@@ -1,6 +1,7 @@
 namespace Cirreum.Authentication.SignedRequest;
 
 using Cirreum.Authentication.Configuration;
+using Cirreum.AuthenticationProvider.SignedRequest;
 using Cirreum.Coordination;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
@@ -9,35 +10,31 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.IO;
 using System.Security.Claims;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Encodings.Web;
+using System.Threading;
 
 /// <summary>
-/// Authentication handler that validates signed requests using HMAC signatures.
+/// Authentication handler that validates RFC 9421 HTTP Message Signatures.
 /// </summary>
 /// <remarks>
 /// <para>
-/// This handler reads the following headers:
-/// <list type="bullet">
-///   <item><c>X-Client-Id</c> - Public client identifier for database lookup</item>
-///   <item><c>X-Timestamp</c> - Unix timestamp for replay protection</item>
-///   <item><c>X-Signature</c> - HMAC signature in format "v1=hexstring"</item>
-/// </list>
+/// The request carries <c>Signature</c> and <c>Signature-Input</c> (RFC 8941 structured fields) plus a
+/// <c>Content-Digest</c> (RFC 9530). The handler parses them, reconstructs the byte-identical signature base
+/// via the shared <c>SignatureBaseBuilder</c> (ADR-0021 §8), and asks the
+/// <see cref="ISignedRequestClientResolver"/> to resolve the <c>keyid</c> credential and verify the signature.
+/// It then binds the body via <c>Content-Digest</c> and, under the strict-nonce posture, claims the <c>nonce</c>
+/// for single-use replay protection.
 /// </para>
 /// <para>
-/// The signature is computed over: {timestamp}.{method}.{path}.{bodyHash}
+/// Audience is the per-service credential (the <c>keyid</c>); transport host/scheme/IP are not signed and not
+/// consulted (host-independent, per the 2026-06-08 redesign).
 /// </para>
-/// </remarks>
-/// <remarks>
-/// Initializes a new instance of the <see cref="SignedRequestAuthenticationHandler"/> class.
 /// </remarks>
 public class SignedRequestAuthenticationHandler(
 	IOptionsMonitor<SignedRequestAuthenticationOptions> options,
 	ILoggerFactory logger,
 	UrlEncoder encoder,
 	ISignedRequestClientResolver clientResolver,
-	ISignatureValidator signatureValidator,
 	IOptions<SignatureValidationOptions> validationOptions,
 	RecyclableMemoryStreamManager streamManager,
 	ISignatureValidationEvents? events = null
@@ -54,192 +51,105 @@ public class SignedRequestAuthenticationHandler(
 	/// <inheritdoc/>
 	protected override async Task<AuthenticateResult> HandleAuthenticateAsync() {
 
-		// 1. Extract required headers
-		var clientId = this.GetHeaderValue(this._validationOptions.ClientIdHeaderName);
-		var signature = this.GetHeaderValue(this._validationOptions.SignatureHeaderName);
-		var timestampStr = this.GetHeaderValue(this._validationOptions.TimestampHeaderName);
+		var signatureInput = this.GetHeader(SignedRequestDefaults.SignatureInputHeader);
+		var signature = this.GetHeader(SignedRequestDefaults.SignatureHeader);
 
-		// Check for missing headers
-		var missingHeaders = new List<string>();
-		if (string.IsNullOrEmpty(clientId)) {
-			missingHeaders.Add(this._validationOptions.ClientIdHeaderName);
+		// No signature headers at all — let other handlers run.
+		if (string.IsNullOrEmpty(signatureInput) && string.IsNullOrEmpty(signature)) {
+			return AuthenticateResult.NoResult();
 		}
 
-		if (string.IsNullOrEmpty(signature)) {
-			missingHeaders.Add(this._validationOptions.SignatureHeaderName);
+		if (string.IsNullOrEmpty(signatureInput) || string.IsNullOrEmpty(signature)) {
+			return await this.FailAsync(null, SignatureFailureType.MalformedSignature,
+				"Both Signature and Signature-Input headers are required");
 		}
 
-		if (string.IsNullOrEmpty(timestampStr)) {
-			missingHeaders.Add(this._validationOptions.TimestampHeaderName);
+		// RFC 9421 wire parse. v1 requires exactly one signature; multiple labels are ambiguous for a single
+		// authentication decision and are rejected.
+		if (!SignatureWireParser.TryParse(signatureInput, signature, out var entries) || entries.Count != 1) {
+			return await this.FailAsync(null, SignatureFailureType.MalformedSignature,
+				"Malformed or ambiguous Signature / Signature-Input headers");
 		}
 
-		if (missingHeaders.Count > 0) {
-			// If no auth headers at all, return NoResult to allow other handlers
-			if (missingHeaders.Count == 3) {
-				return AuthenticateResult.NoResult();
-			}
+		var entry = entries[0];
 
-			// Partial headers = bad request
-			await this.RaiseFailureEventAsync(clientId, SignatureFailureType.MissingHeaders,
-				$"Missing: {string.Join(", ", missingHeaders)}");
-			return AuthenticateResult.Fail($"Missing required headers: {string.Join(", ", missingHeaders)}");
-		}
-
-		// 2. Parse timestamp
-		if (!long.TryParse(timestampStr, out var timestamp)) {
-			await this.RaiseFailureEventAsync(clientId, SignatureFailureType.InvalidTimestamp, "Invalid timestamp format");
-			return AuthenticateResult.Fail("Invalid timestamp format");
-		}
-
-		// 3. Check if client is blocked (rate limiting)
-		if (await this._events.IsClientBlockedAsync(clientId!, this.Context.RequestAborted)) {
-			await this.RaiseFailureEventAsync(clientId, SignatureFailureType.Other, "Client blocked");
-			return AuthenticateResult.Fail("Client temporarily blocked");
-		}
-
-		// 4. Compute body hash
-		var bodyHash = await this.ComputeBodyHashAsync();
-
-		// 5. Build request path
-		var path = this._validationOptions.IncludeQueryString
-			? this.Request.Path + this.Request.QueryString
-			: this.Request.Path.ToString();
-
-		// 6. Build context
-		var context = new SignedRequestContext(
-			clientId: clientId!,
-			signature: signature!,
-			timestamp: timestamp,
-			httpMethod: this.Request.Method,
-			path: path,
-			bodyHash: bodyHash,
-			headers: this.BuildHeadersDictionary());
-
-		// 7. Validate
-		var result = await clientResolver.ValidateAsync(context, this.Context.RequestAborted);
-
-		if (!result.IsSuccess || result.Client is null) {
-			await this.RaiseFailureEventAsync(clientId, result.FailureType, result.FailureReason ?? "Validation failed");
-
-			if (this.Logger.IsEnabled(LogLevel.Warning)) {
-				this.Logger.LogWarning(
-					"Signed request validation failed for client {ClientId}: {Reason}",
-					clientId,
-					result.FailureReason ?? "Unknown");
-			}
-			return AuthenticateResult.Fail(result.FailureReason ?? "Invalid signature");
-		}
-
-		// 8. Build claims principal
-		var client = result.Client;
-
-		// 8a. Strict-nonce replay protection (ADR-0021): the signature is now proven valid, so atomically
-		//     claim its digest. The same signed request is single-use within the timestamp window; a replay
-		//     loses the claim and is rejected. All failure paths fail closed.
-		if (this._validationOptions.RequireStrictNonce) {
-			var replayGuard = this.Context.RequestServices.GetService<IReplayGuard>();
-
-			if (replayGuard is null) {
-				// Misconfiguration: strict-nonce is on but no coordination backend was chosen. The umbrella
-				// boot validator (CoordinationPostureValidator) should have failed startup; this is the
-				// request-time failsafe. Fail closed — never authenticate replay-exposed.
-				const string reason = "Replay protection is required but no coordination backend is registered";
-				await this.RaiseFailureEventAsync(clientId, SignatureFailureType.ReplayProtectionUnavailable, reason);
-				if (this.Logger.IsEnabled(LogLevel.Error)) {
-					this.Logger.LogError("Signed request rejected for client {ClientId}: {Reason}", clientId, reason);
-				}
-				return AuthenticateResult.Fail(reason);
-			}
-
-			// Hold the claim for exactly as long as a replay of this request would still pass timestamp
-			// validation. That is the effective (per-credential) tolerance the resolver applied — using the
-			// global default would under-cover a client granted a wider tolerance and re-open a replay window.
-			// Fall back to the global tolerances when the resolver did not report an effective window.
-			if (result.ReplayWindow is null
-				&& this.Logger.IsEnabled(LogLevel.Warning)
-				&& System.Threading.Interlocked.CompareExchange(ref _warnedNullReplayWindow, 1, 0) == 0) {
-				// The shipped DynamicSignedRequestClientResolver always reports the window. A custom resolver that
-				// withholds it forces this global fallback — safe only if that resolver also validates within the
-				// global tolerances. If it accepts a WIDER per-credential window, the nonce under-covers it and a
-				// replay gap reopens; the handler cannot detect that, so warn once. (ADR-0021.)
-				this.Logger.LogWarning(
-					"Strict-nonce is enabled but the signed-request resolver returned no effective replay window; " +
-					"the nonce TTL is sized from the global timestamp tolerances. A custom {Resolver} that accepts a " +
-					"timestamp window wider than the global SignatureValidationOptions must report it via " +
-					"SignedRequestValidationResult.ReplayWindow, or a replay gap reopens. (Logged once.)",
-					nameof(ISignedRequestClientResolver));
-			}
-
-			var ttl = result.ReplayWindow
-				?? (this._validationOptions.TimestampTolerance + this._validationOptions.FutureTimestampTolerance);
-			var token = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(signature!)));
-
-			bool claimed;
-			try {
-				claimed = await replayGuard.TryClaimAsync(token, ttl, this.Context.RequestAborted);
-			} catch (Exception ex) when (ex is not OperationCanceledException) {
-				// Backend unreachable (e.g. Redis down). Fail closed gracefully — a clean authentication
-				// failure rather than an unhandled 500 — logged and surfaced through the event sink so the
-				// outage stays observable. (Cancellation propagates: that is a normal client disconnect.)
-				const string reason = "Replay protection backend is unavailable";
-				await this.RaiseFailureEventAsync(clientId, SignatureFailureType.ReplayProtectionUnavailable, reason);
-				if (this.Logger.IsEnabled(LogLevel.Error)) {
-					this.Logger.LogError(ex, "Signed request rejected for client {ClientId}: {Reason}", clientId, reason);
-				}
-				return AuthenticateResult.Fail("Replay protection is temporarily unavailable");
-			}
-
-			if (!claimed) {
-				const string reason = "Replayed signed request";
-				await this.RaiseFailureEventAsync(clientId, SignatureFailureType.ReplayDetected, reason);
-				if (this.Logger.IsEnabled(LogLevel.Warning)) {
-					this.Logger.LogWarning("Signed request rejected for client {ClientId}: {Reason}", clientId, reason);
-				}
-				return AuthenticateResult.Fail(reason);
+		// Every required covered component must be present, else the signature does not bind what the server
+		// relies on (RFC 9421 §7.2.1 — coverage is declared, never opportunistic).
+		foreach (var required in this._validationOptions.RequiredCoveredComponents) {
+			if (!entry.CoveredComponents.Contains(required)) {
+				return await this.FailAsync(entry.KeyId, SignatureFailureType.UnsupportedComponent,
+					$"Signature does not cover required component '{required}'");
 			}
 		}
 
-		var claims = new List<Claim> {
-			new(ClaimTypes.NameIdentifier, client.ClientId),
-			new(ClaimTypes.Name, client.ClientName),
-			new("client_type", "signed_request"),
-			new("auth_scheme", client.Scheme)
+		// Anti-abuse hook (consumer-supplied), keyed on the credential identifier.
+		if (await this._events.IsClientBlockedAsync(entry.KeyId, this.Context.RequestAborted)) {
+			return await this.FailAsync(entry.KeyId, SignatureFailureType.Other, "Client blocked");
+		}
+
+		// Reconstruct the signature base from the request via the shared §8 builder. The covered field values
+		// (e.g. Content-Digest) come from the request headers; derived components from the request line.
+		var fields = this.BuildCoveredFields(entry.CoveredComponents);
+		var components = SignatureBaseComponents.FromRequest(
+			this.Request.Method, this.Request.Path.ToUriComponent(), this.Request.QueryString.Value, fields);
+
+		byte[] signatureBase;
+		try {
+			signatureBase = SignatureBaseBuilder.BuildBase(components, entry.CoveredComponents, entry.SignatureParamsValue);
+		} catch (InvalidOperationException ex) {
+			// An unsupported derived component (e.g. @authority) or a covered field absent from the request.
+			return await this.FailAsync(entry.KeyId, SignatureFailureType.UnsupportedComponent, ex.Message);
+		}
+
+		var context = new SignedRequestContext {
+			KeyId = entry.KeyId,
+			Algorithm = entry.Algorithm,
+			SignatureBase = signatureBase,
+			Signature = entry.Signature,
+			Created = entry.Created,
+			Expires = entry.Expires,
+			Tag = entry.Tag,
 		};
 
-		if (!string.IsNullOrEmpty(client.CredentialId)) {
-			claims.Add(new Claim("credential_id", client.CredentialId));
+		var result = await clientResolver.ValidateAsync(context, this.Context.RequestAborted);
+		if (!result.IsSuccess || result.Client is null) {
+			return await this.FailAsync(entry.KeyId, result.FailureType, result.FailureReason ?? "Invalid signature", warn: true);
 		}
 
-		// Add roles
-		foreach (var role in client.Roles) {
-			claims.Add(new Claim(ClaimTypes.Role, role));
-		}
+		var client = result.Client;
 
-		// Add custom claims
-		if (client.Claims is not null) {
-			foreach (var (claimType, claimValue) in client.Claims) {
-				claims.Add(new Claim(claimType, claimValue));
+		// Content-Digest binds the body (RFC 9530): the signature proved the digest STRING; now prove that string
+		// matches the actual body. Required on every method — a bodyless request signs the empty-body digest.
+		if (entry.CoveredComponents.Contains(SignatureComponentNames.ContentDigest)) {
+			var digestHeader = this.GetHeader(SignedRequestDefaults.ContentDigestHeader);
+			var body = await this.ReadBodyAsync();
+			if (!ContentDigest.Verify(digestHeader, body)) {
+				return await this.FailAsync(entry.KeyId, SignatureFailureType.ContentDigestMismatch,
+					"Content-Digest does not match the request body");
 			}
 		}
 
-		var identity = new ClaimsIdentity(claims, this.Scheme.Name);
-		var principal = new ClaimsPrincipal(identity);
-		var ticket = new AuthenticationTicket(principal, this.Scheme.Name);
+		// Strict-nonce replay protection (ADR-0021): claim the RFC 9421 nonce now the signature is proven valid.
+		if (this._validationOptions.RequireStrictNonce) {
+			var replayFailure = await this.ClaimNonceAsync(entry, result.ReplayWindow);
+			if (replayFailure is not null) {
+				return replayFailure;
+			}
+		}
 
-		// Raise success event
+		var ticket = this.BuildTicket(client);
+
 		await this._events.OnValidationSucceededAsync(new SignatureValidationSucceededContext {
 			Client = client,
 			CredentialId = client.CredentialId,
 			RemoteIpAddress = this.Context.Connection.RemoteIpAddress?.ToString(),
-			RequestPath = path,
-			HttpMethod = this.Request.Method
+			RequestPath = this.Request.Path,
+			HttpMethod = this.Request.Method,
 		}, this.Context.RequestAborted);
 
 		if (this.Logger.IsEnabled(LogLevel.Debug)) {
 			this.Logger.LogDebug(
-				"Signed request authenticated for client {ClientId} ({ClientName})",
-				client.ClientId,
-				client.ClientName);
+				"Signed request authenticated for keyid {KeyId} ({ClientName})", client.ClientId, client.ClientName);
 		}
 
 		return AuthenticateResult.Success(ticket);
@@ -258,18 +168,114 @@ public class SignedRequestAuthenticationHandler(
 		return Task.CompletedTask;
 	}
 
-	private string? GetHeaderValue(string headerName) {
-		if (this.Request.Headers.TryGetValue(headerName, out var values)) {
-			return values.FirstOrDefault();
+	// Returns a failure AuthenticateResult on a strict-nonce problem, or null when the nonce was claimed.
+	private async Task<AuthenticateResult?> ClaimNonceAsync(ParsedSignature entry, TimeSpan? replayWindow) {
+		var nonce = entry.Nonce;
+		if (string.IsNullOrEmpty(nonce)) {
+			return await this.FailAsync(entry.KeyId, SignatureFailureType.MissingNonce,
+				"A nonce is required under the strict-nonce posture", error: true);
 		}
+
+		if (nonce.Length < this._validationOptions.MinimumNonceLength) {
+			return await this.FailAsync(entry.KeyId, SignatureFailureType.WeakNonce,
+				"The nonce is shorter than the required minimum", warn: true);
+		}
+
+		var replayGuard = this.Context.RequestServices.GetService<IReplayGuard>();
+		if (replayGuard is null) {
+			// Strict-nonce on but no coordination backend chosen. The umbrella's CoordinationPostureValidator
+			// should have failed startup; this is the request-time failsafe. Fail closed.
+			return await this.FailAsync(entry.KeyId, SignatureFailureType.ReplayProtectionUnavailable,
+				"Replay protection is required but no coordination backend is registered", error: true);
+		}
+
+		// Hold the claim for exactly as long as a replay would still pass freshness validation — the effective
+		// (per-credential) window the resolver reported. Fall back to the global tolerances when it reports none.
+		if (replayWindow is null
+			&& this.Logger.IsEnabled(LogLevel.Warning)
+			&& Interlocked.CompareExchange(ref _warnedNullReplayWindow, 1, 0) == 0) {
+			this.Logger.LogWarning(
+				"Strict-nonce is enabled but the signed-request resolver returned no effective replay window; " +
+				"the nonce TTL is sized from the global timestamp tolerances. A custom {Resolver} that accepts a " +
+				"timestamp window wider than the global SignatureValidationOptions must report it via " +
+				"SignedRequestValidationResult.ReplayWindow, or a replay gap reopens. (Logged once.)",
+				nameof(ISignedRequestClientResolver));
+		}
+
+		var ttl = replayWindow
+			?? (this._validationOptions.TimestampTolerance + this._validationOptions.FutureTimestampTolerance);
+
+		bool claimed;
+		try {
+			claimed = await replayGuard.TryClaimAsync(nonce, ttl, this.Context.RequestAborted);
+		} catch (Exception ex) when (ex is not OperationCanceledException) {
+			// Backend unreachable (e.g. Redis down). Fail closed gracefully — a clean authentication failure
+			// rather than an unhandled 500 — logged and surfaced through the event sink. (Cancellation
+			// propagates: that is a normal client disconnect.)
+			if (this.Logger.IsEnabled(LogLevel.Error)) {
+				this.Logger.LogError(ex, "Replay protection backend unavailable for keyid {KeyId}", entry.KeyId);
+			}
+			await this.RaiseFailureAsync(entry.KeyId, SignatureFailureType.ReplayProtectionUnavailable,
+				"Replay protection backend is unavailable");
+			return AuthenticateResult.Fail("Replay protection is temporarily unavailable");
+		}
+
+		if (!claimed) {
+			return await this.FailAsync(entry.KeyId, SignatureFailureType.ReplayDetected, "Replayed signed request", warn: true);
+		}
+
 		return null;
 	}
 
-	private async Task<string?> ComputeBodyHashAsync() {
-		if (this.Request.Method is "GET" or "HEAD" or "DELETE" or "OPTIONS") {
-			return null;
+	private AuthenticationTicket BuildTicket(SignedRequestClient client) {
+		var claims = new List<Claim> {
+			new(ClaimTypes.NameIdentifier, client.ClientId),
+			new(ClaimTypes.Name, client.ClientName),
+			new("client_type", "signed_request"),
+			new("auth_scheme", client.Scheme),
+		};
+
+		if (!string.IsNullOrEmpty(client.CredentialId)) {
+			claims.Add(new Claim("credential_id", client.CredentialId));
 		}
 
+		foreach (var role in client.Roles) {
+			claims.Add(new Claim(ClaimTypes.Role, role));
+		}
+
+		if (client.Claims is not null) {
+			foreach (var (claimType, claimValue) in client.Claims) {
+				claims.Add(new Claim(claimType, claimValue));
+			}
+		}
+
+		var identity = new ClaimsIdentity(claims, this.Scheme.Name);
+		return new AuthenticationTicket(new ClaimsPrincipal(identity), this.Scheme.Name);
+	}
+
+	// Collects the covered HTTP field values from the request (derived '@' components are not fields). A covered
+	// field that is absent from the request is left out, so BuildBase rejects the signature as incomplete.
+	private Dictionary<string, string> BuildCoveredFields(IReadOnlyList<string> coveredComponents) {
+		var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+		foreach (var component in coveredComponents) {
+			if (component.Length == 0 || component[0] == '@') {
+				continue;
+			}
+
+			var value = this.GetHeader(component);
+			if (value is not null) {
+				fields[component] = value;
+			}
+		}
+
+		return fields;
+	}
+
+	private string? GetHeader(string headerName) =>
+		this.Request.Headers.TryGetValue(headerName, out var values) ? values.ToString() : null;
+
+	private async Task<byte[]> ReadBodyAsync() {
 		if (!this.Request.Body.CanSeek) {
 			this.Request.EnableBuffering();
 		}
@@ -279,43 +285,33 @@ public class SignedRequestAuthenticationHandler(
 			this.Request.Body.Position = 0;
 			await using var memoryStream = this._streamManager.GetStream();
 			await this.Request.Body.CopyToAsync(memoryStream, this.Context.RequestAborted);
-
-			return signatureValidator.ComputeBodyHash(
-				memoryStream.GetBuffer().AsSpan(0, (int)memoryStream.Length));
-
+			return memoryStream.ToArray();
 		} finally {
 			this.Request.Body.Position = originalPosition;
 		}
 	}
 
-	private Dictionary<string, string> BuildHeadersDictionary() {
-		var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+	private async Task<AuthenticateResult> FailAsync(
+		string? keyId, SignatureFailureType failureType, string reason, bool warn = false, bool error = false) {
 
-		foreach (var header in this.Request.Headers) {
-			// Skip auth headers from context (they're already extracted)
-			if (string.Equals(header.Key, this._validationOptions.ClientIdHeaderName, StringComparison.OrdinalIgnoreCase) ||
-				string.Equals(header.Key, this._validationOptions.SignatureHeaderName, StringComparison.OrdinalIgnoreCase) ||
-				string.Equals(header.Key, this._validationOptions.TimestampHeaderName, StringComparison.OrdinalIgnoreCase)) {
-				continue;
-			}
+		await this.RaiseFailureAsync(keyId, failureType, reason);
 
-			var value = header.Value.FirstOrDefault();
-			if (!string.IsNullOrEmpty(value)) {
-				headers[header.Key] = value;
-			}
+		if (error && this.Logger.IsEnabled(LogLevel.Error)) {
+			this.Logger.LogError("Signed request rejected for keyid {KeyId}: {Reason}", keyId, reason);
+		} else if (warn && this.Logger.IsEnabled(LogLevel.Warning)) {
+			this.Logger.LogWarning("Signed request rejected for keyid {KeyId}: {Reason}", keyId, reason);
 		}
 
-		return headers;
+		return AuthenticateResult.Fail(reason);
 	}
 
-	private Task RaiseFailureEventAsync(string? clientId, SignatureFailureType failureType, string reason) {
-		return this._events.OnValidationFailedAsync(new SignatureValidationFailedContext {
-			ClientId = clientId,
+	private Task RaiseFailureAsync(string? keyId, SignatureFailureType failureType, string reason) =>
+		this._events.OnValidationFailedAsync(new SignatureValidationFailedContext {
+			ClientId = keyId,
 			FailureType = failureType,
 			FailureReason = reason,
 			RemoteIpAddress = this.Context.Connection.RemoteIpAddress?.ToString(),
 			RequestPath = this.Request.Path,
-			HttpMethod = this.Request.Method
+			HttpMethod = this.Request.Method,
 		}, this.Context.RequestAborted);
-	}
 }

@@ -1,83 +1,51 @@
 namespace Cirreum.Authentication.SignedRequest;
 
 using Cirreum.Authentication.Configuration;
+using Cirreum.AuthenticationProvider.SignedRequest;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using System.Text;
 
 /// <summary>
-/// Base class for implementing database-backed or external signed request resolvers.
-/// Handles common concerns like timestamp validation, signature verification, and expiration checking.
+/// Base class for database-backed or external SignedRequest credential resolvers. Implement
+/// <see cref="LookupCredentialsAsync"/> to return the active credentials for a presenting <c>keyid</c>; the
+/// base class resolves the RFC 9421 algorithm, applies per-credential freshness (with the strict-nonce replay
+/// window), enforces any explicit audience binding, and verifies the signature against the request's signature
+/// base.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Inherit from this class to create a custom resolver. You only need to implement:
-/// <list type="bullet">
-///   <item><see cref="LookupCredentialsAsync"/> - your database/external lookup logic</item>
-/// </list>
+/// Return all active credentials for the <c>keyid</c>; the base class tries each until one verifies, enabling
+/// zero-downtime key rotation. The lookup should hit an index.
 /// </para>
-/// <para>
-/// The base class handles timestamp validation, signature computation and comparison,
-/// expiration checking, and result construction.
-/// </para>
-/// </remarks>
 /// <example>
 /// <code>
-/// public class MyDatabaseResolver : DynamicSignedRequestClientResolver {
-///     private readonly ICredentialRepository _repository;
-///
-///     public MyDatabaseResolver(
-///         ICredentialRepository repository,
-///         ISignatureValidator validator,
-///         IOptions&lt;SignatureValidationOptions&gt; options,
-///         ILogger&lt;MyDatabaseResolver&gt; logger)
-///         : base(validator, options, logger) {
-///         _repository = repository;
-///     }
-///
+/// public sealed class MyResolver(ICredentialRepository repo, ISignedRequestAlgorithmResolver algs,
+///         IOptions&lt;SignatureValidationOptions&gt; options, ILogger&lt;MyResolver&gt; logger)
+///     : DynamicSignedRequestClientResolver(algs, options, logger) {
 ///     protected override Task&lt;IEnumerable&lt;StoredSigningCredential&gt;&gt; LookupCredentialsAsync(
-///         string clientId,
-///         CancellationToken cancellationToken) {
-///         return _repository.FindActiveCredentialsByClientIdAsync(clientId, cancellationToken);
-///     }
+///         string keyId, CancellationToken ct) => repo.FindActiveByKeyIdAsync(keyId, ct);
 /// }
 /// </code>
 /// </example>
-/// <remarks>
-/// Initializes a new instance of the <see cref="DynamicSignedRequestClientResolver"/> class.
 /// </remarks>
-/// <param name="validator">The signature validator.</param>
-/// <param name="options">The validation options.</param>
-/// <param name="logger">The logger instance.</param>
 public abstract class DynamicSignedRequestClientResolver(
-	ISignatureValidator validator,
+	ISignedRequestAlgorithmResolver algorithms,
 	IOptions<SignatureValidationOptions> options,
 	ILogger logger
 ) : ISignedRequestClientResolver {
 
-	private readonly ISignatureValidator _validator = validator ?? throw new ArgumentNullException(nameof(validator));
+	private readonly ISignedRequestAlgorithmResolver _algorithms = algorithms ?? throw new ArgumentNullException(nameof(algorithms));
 	private readonly SignatureValidationOptions _options = options?.Value ?? new SignatureValidationOptions();
 	private readonly ILogger _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
 	/// <summary>
-	/// Looks up stored signing credentials from the database or external source.
+	/// Looks up the active signing credentials for a presenting <c>keyid</c> from the database or external
+	/// source. Return all active credentials (the base class tries each, supporting key rotation), or an empty
+	/// collection if none exist.
 	/// </summary>
-	/// <param name="clientId">The client ID to look up.</param>
-	/// <param name="cancellationToken">A token to cancel the operation.</param>
-	/// <returns>
-	/// The stored credentials for the given client, or an empty collection if none exist.
-	/// Multiple credentials may be returned to support key rotation.
-	/// </returns>
-	/// <remarks>
-	/// <para>
-	/// Return all active credentials for the client. The base class will try each one
-	/// until it finds a matching signature, enabling zero-downtime key rotation.
-	/// </para>
-	/// <para>
-	/// The query should be efficient - lookup by client ID should hit an index.
-	/// </para>
-	/// </remarks>
 	protected abstract Task<IEnumerable<StoredSigningCredential>> LookupCredentialsAsync(
-		string clientId,
+		string keyId,
 		CancellationToken cancellationToken);
 
 	/// <inheritdoc/>
@@ -85,145 +53,114 @@ public abstract class DynamicSignedRequestClientResolver(
 		SignedRequestContext context,
 		CancellationToken cancellationToken = default) {
 
-		// 1. Validate signature format (basic check before lookup)
-		var version = context.GetSignatureVersion();
-		if (string.IsNullOrEmpty(version)) {
+		ArgumentNullException.ThrowIfNull(context);
+
+		// Resolve the algorithm named on the wire (v1 ships hmac-sha256). An unknown alg is rejected before any
+		// credential work — it can never verify.
+		var algorithm = this._algorithms.Resolve(context.Algorithm);
+		if (algorithm is null) {
 			if (this._logger.IsEnabled(LogLevel.Debug)) {
-				this._logger.LogDebug(
-					"Invalid signature format for client {ClientId}",
-					context.ClientId);
+				this._logger.LogDebug("Unsupported signature algorithm {Algorithm} for keyid {KeyId}", context.Algorithm, context.KeyId);
 			}
-			return SignedRequestValidationResult.InvalidSignatureFormat("Missing version prefix");
+			return SignedRequestValidationResult.Fail(
+				SignatureFailureType.UnsupportedAlgorithm, $"Unsupported signature algorithm '{context.Algorithm}'");
 		}
 
-		// 2. Lookup credentials first - we need per-client options for validation
 		IEnumerable<StoredSigningCredential> credentials;
 		try {
-			credentials = await this.LookupCredentialsAsync(context.ClientId, cancellationToken);
+			credentials = await this.LookupCredentialsAsync(context.KeyId, cancellationToken);
 		} catch (Exception ex) {
 			if (this._logger.IsEnabled(LogLevel.Error)) {
-				this._logger.LogError(ex,
-					"Error looking up credentials for client {ClientId}",
-					context.ClientId);
+				this._logger.LogError(ex, "Error looking up credentials for keyid {KeyId}", context.KeyId);
 			}
 			return SignedRequestValidationResult.Failed("Credential lookup failed");
 		}
 
-		// 3. Try each credential until we find a match (supports key rotation)
-		StoredSigningCredential? matchedCredential = null;
-		// Effective tolerances of the matched credential — captured so the success result can report the
-		// replay window the handler must cover (strict-nonce). Per-credential overrides may exceed the global
-		// default, so sizing the nonce from the global value alone would re-open a replay window.
-		TimeSpan matchedTimestampTolerance = default;
-		TimeSpan matchedFutureTimestampTolerance = default;
+		var materialized = credentials as IReadOnlyCollection<StoredSigningCredential> ?? [.. credentials];
 
-		foreach (var credential in credentials) {
-			// Skip inactive credentials
+		StoredSigningCredential? matched = null;
+		TimeSpan matchedTolerance = default;
+		TimeSpan matchedFutureTolerance = default;
+		var audienceMismatch = false;
+
+		foreach (var credential in materialized) {
 			if (!credential.IsActive) {
 				continue;
 			}
 
-			// Check expiration
-			if (credential.ExpiresAt.HasValue && credential.ExpiresAt.Value < DateTimeOffset.UtcNow) {
-				if (this._logger.IsEnabled(LogLevel.Debug)) {
-					this._logger.LogDebug(
-						"Credential {CredentialId} for client {ClientId} has expired",
-						credential.CredentialId,
-						context.ClientId);
-				}
+			if (credential.ExpiresAt is { } credentialExpiry && credentialExpiry < DateTimeOffset.UtcNow) {
 				continue;
 			}
 
-			// Get effective values (per-client override or app defaults)
-			var supportedVersions = credential.SupportedSignatureVersions ?? this._options.SupportedSignatureVersions;
-			var timestampTolerance = credential.TimestampTolerance ?? this._options.TimestampTolerance;
-			var futureTimestampTolerance = credential.FutureTimestampTolerance ?? this._options.FutureTimestampTolerance;
-
-			// Validate signature version
-			if (!supportedVersions.Contains(version)) {
-				if (this._logger.IsEnabled(LogLevel.Debug)) {
-					this._logger.LogDebug(
-						"Unsupported signature version {Version} for credential {CredentialId}",
-						version,
-						credential.CredentialId);
-				}
+			// Per-credential algorithm restriction (null => any registered algorithm is acceptable).
+			if (credential.SupportedAlgorithms is { } allowed && !allowed.Contains(context.Algorithm)) {
 				continue;
 			}
 
-			// Validate timestamp
-			if (!ValidateTimestamp(context.Timestamp, timestampTolerance, futureTimestampTolerance)) {
-				if (this._logger.IsEnabled(LogLevel.Debug)) {
-					this._logger.LogDebug(
-						"Timestamp validation failed for credential {CredentialId}: {Timestamp}",
-						credential.CredentialId,
-						context.TimestampAsDateTime);
-				}
+			var tolerance = credential.TimestampTolerance ?? this._options.TimestampTolerance;
+			var futureTolerance = credential.FutureTimestampTolerance ?? this._options.FutureTimestampTolerance;
+
+			if (!ValidateFreshness(context.Created, context.Expires, tolerance, futureTolerance)) {
 				continue;
 			}
 
-			// Validate signature
-			if (this._validator.ValidateSignature(context, credential.SigningSecret)) {
-				matchedCredential = credential;
-				matchedTimestampTolerance = timestampTolerance;
-				matchedFutureTimestampTolerance = futureTimestampTolerance;
+			// Audience: a credential bound to an explicit audience requires the matching tag (the shared-credential
+			// defense). When null the keyid is the implicit audience and no tag is required.
+			if (credential.Audience is { } audience && !string.Equals(audience, context.Tag, StringComparison.Ordinal)) {
+				audienceMismatch = true;
+				continue;
+			}
+
+			if (algorithm.Verify(context.SignatureBase.Span, context.Signature.Span, Encoding.UTF8.GetBytes(credential.SigningSecret))) {
+				matched = credential;
+				matchedTolerance = tolerance;
+				matchedFutureTolerance = futureTolerance;
 				break;
 			}
 		}
 
-		if (matchedCredential is null) {
-			// Check if we found any credentials at all
-			var hasAnyCredentials = credentials.Any();
-
-			if (!hasAnyCredentials) {
-				if (this._logger.IsEnabled(LogLevel.Debug)) {
-					this._logger.LogDebug(
-						"No credentials found for client {ClientId}",
-						context.ClientId);
-				}
+		if (matched is null) {
+			if (materialized.Count == 0) {
 				return SignedRequestValidationResult.ClientNotFound();
 			}
 
-			if (this._logger.IsEnabled(LogLevel.Debug)) {
-				this._logger.LogDebug(
-					"Invalid signature for client {ClientId}",
-					context.ClientId);
+			if (audienceMismatch) {
+				return SignedRequestValidationResult.Fail(SignatureFailureType.AudienceMismatch, "Audience (tag) mismatch");
 			}
+
 			return SignedRequestValidationResult.InvalidSignature();
 		}
 
-		// 4. Success - build client
-		var client = matchedCredential.ToClient();
-
-		if (this._logger.IsEnabled(LogLevel.Debug)) {
-			this._logger.LogDebug(
-				"Signed request validated for client {ClientId} ({ClientName}) using credential {CredentialId}",
-				client.ClientId,
-				client.ClientName,
-				matchedCredential.CredentialId);
-		}
-
-		// Report the effective replay window (the per-credential tolerances actually applied) so strict-nonce
-		// holds the claim for exactly as long as a replay of this request would still pass timestamp validation.
-		var replayWindow = matchedTimestampTolerance + matchedFutureTimestampTolerance;
-		return SignedRequestValidationResult.Success(client, replayWindow);
+		// Report the effective replay window (the per-credential tolerances applied) so the strict-nonce claim is
+		// held for exactly as long as a replay of this request would still pass freshness validation. A
+		// per-credential override may exceed the global default, so the global value alone would under-cover it.
+		var replayWindow = matchedTolerance + matchedFutureTolerance;
+		return SignedRequestValidationResult.Success(matched.ToClient(), replayWindow);
 	}
 
-	/// <summary>
-	/// Validates the timestamp against the provided tolerances.
-	/// </summary>
-	private static bool ValidateTimestamp(long timestamp, TimeSpan timestampTolerance, TimeSpan futureTimestampTolerance) {
-		var requestTime = DateTimeOffset.FromUnixTimeSeconds(timestamp);
+	private static bool ValidateFreshness(long created, long? expires, TimeSpan tolerance, TimeSpan futureTolerance) {
 		var now = DateTimeOffset.UtcNow;
+		var createdTime = DateTimeOffset.FromUnixTimeSeconds(created);
 
-		// Check if timestamp is too old
-		var age = now - requestTime;
-		if (age > timestampTolerance) {
-			return false;
+		if (now - createdTime > tolerance) {
+			return false; // too old
 		}
 
-		// Check if timestamp is too far in the future (clock skew)
-		if (requestTime > now + futureTimestampTolerance) {
-			return false;
+		if (createdTime > now + futureTolerance) {
+			return false; // too far in the future (client clock ahead)
+		}
+
+		if (expires is { } expiresSeconds) {
+			var expiresTime = DateTimeOffset.FromUnixTimeSeconds(expiresSeconds);
+			if (now > expiresTime) {
+				return false; // already expired
+			}
+
+			// Clamp: a client-declared validity wider than the server's freshness window is rejected, so the
+			// replay nonce TTL (= tolerance + futureTolerance) always covers the accepted window. (ADR-0021.)
+			if (expiresTime - createdTime > tolerance + futureTolerance) {
+				return false;
+			}
 		}
 
 		return true;

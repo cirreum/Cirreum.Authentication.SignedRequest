@@ -83,14 +83,19 @@ public sealed record StoredSigningCredential {
 	public TimeSpan? FutureTimestampTolerance { get; init; }
 
 	/// <summary>
-	/// Gets optional per-client supported signature versions that override <see cref="SignatureValidationOptions.SupportedSignatureVersions"/>.
-	/// If null, the application's default is used.
+	/// Gets the optional set of permitted RFC 9421 algorithm identifiers (e.g. <c>hmac-sha256</c>) for this
+	/// credential. When <see langword="null"/> any registered algorithm is accepted; set it to pin a
+	/// credential to specific algorithms.
 	/// </summary>
-	/// <remarks>
-	/// Use this to restrict or expand allowed signature versions for specific clients.
-	/// For example, allow only "v2" for new clients while legacy clients can still use "v1".
-	/// </remarks>
-	public IReadOnlySet<string>? SupportedSignatureVersions { get; init; }
+	public IReadOnlySet<string>? SupportedAlgorithms { get; init; }
+
+	/// <summary>
+	/// Gets the optional explicit audience this credential is bound to (the RFC 9421 <c>tag</c>). When set, a
+	/// request signed with this credential must carry a matching <c>tag</c> or it is rejected — the defense for
+	/// a credential deliberately shared across more than one audience (ADR-0021). When <see langword="null"/>
+	/// the credential (<c>keyid</c>) is itself the implicit audience.
+	/// </summary>
+	public string? Audience { get; init; }
 
 	/// <summary>
 	/// Converts this stored credential to a <see cref="SignedRequestClient"/> for authentication.
