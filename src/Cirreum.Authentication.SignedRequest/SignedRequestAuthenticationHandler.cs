@@ -181,7 +181,15 @@ public class SignedRequestAuthenticationHandler(
 				"The nonce is shorter than the required minimum", warn: true);
 		}
 
-		var replayGuard = this.Context.RequestServices.GetService<IReplayGuard>();
+		IReplayGuard? replayGuard;
+		try {
+			replayGuard = this.Context.RequestServices.GetService<IReplayGuard>();
+		} catch (Exception ex) when (ex is not OperationCanceledException) {
+			// The backend's DI factory threw during activation (e.g. a Redis multiplexer constructed lazily
+			// during an outage). Fail closed — a clean 401, not an unhandled 500.
+			return await this.ReplayBackendUnavailableAsync(entry.KeyId, ex);
+		}
+
 		if (replayGuard is null) {
 			// Strict-nonce on but no coordination backend chosen. The umbrella's CoordinationPostureValidator
 			// should have failed startup; this is the request-time failsafe. Fail closed.
@@ -210,14 +218,8 @@ public class SignedRequestAuthenticationHandler(
 			claimed = await replayGuard.TryClaimAsync(nonce, ttl, this.Context.RequestAborted);
 		} catch (Exception ex) when (ex is not OperationCanceledException) {
 			// Backend unreachable (e.g. Redis down). Fail closed gracefully — a clean authentication failure
-			// rather than an unhandled 500 — logged and surfaced through the event sink. (Cancellation
-			// propagates: that is a normal client disconnect.)
-			if (this.Logger.IsEnabled(LogLevel.Error)) {
-				this.Logger.LogError(ex, "Replay protection backend unavailable for keyid {KeyId}", entry.KeyId);
-			}
-			await this.RaiseFailureAsync(entry.KeyId, SignatureFailureType.ReplayProtectionUnavailable,
-				"Replay protection backend is unavailable");
-			return AuthenticateResult.Fail("Replay protection is temporarily unavailable");
+			// rather than an unhandled 500. (Cancellation propagates: that is a normal client disconnect.)
+			return await this.ReplayBackendUnavailableAsync(entry.KeyId, ex);
 		}
 
 		if (!claimed) {
@@ -225,6 +227,18 @@ public class SignedRequestAuthenticationHandler(
 		}
 
 		return null;
+	}
+
+	// Fail closed (clean 401) when the replay backend is unavailable — whether it could not be activated from
+	// DI or threw while claiming the nonce — rather than letting the exception surface as an unhandled 500.
+	private async Task<AuthenticateResult> ReplayBackendUnavailableAsync(string keyId, Exception ex) {
+		if (this.Logger.IsEnabled(LogLevel.Error)) {
+			this.Logger.LogError(ex, "Replay protection backend unavailable for keyid {KeyId}", keyId);
+		}
+
+		await this.RaiseFailureAsync(keyId, SignatureFailureType.ReplayProtectionUnavailable,
+			"Replay protection backend is unavailable");
+		return AuthenticateResult.Fail("Replay protection is temporarily unavailable");
 	}
 
 	private AuthenticationTicket BuildTicket(SignedRequestClient client) {

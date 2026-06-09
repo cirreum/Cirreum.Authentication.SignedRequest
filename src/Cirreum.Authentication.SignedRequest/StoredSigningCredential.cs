@@ -84,8 +84,9 @@ public sealed record StoredSigningCredential {
 
 	/// <summary>
 	/// Gets the optional set of permitted RFC 9421 algorithm identifiers (e.g. <c>hmac-sha256</c>) for this
-	/// credential. When <see langword="null"/> any registered algorithm is accepted; set it to pin a
-	/// credential to specific algorithms.
+	/// credential. When <see langword="null"/> or empty the credential is pinned to the v1 default
+	/// (<c>hmac-sha256</c>) — NOT "any registered algorithm" — so a future asymmetric algorithm can never be
+	/// used against a key provisioned for HMAC. A credential for any non-default algorithm MUST list it here.
 	/// </summary>
 	public IReadOnlySet<string>? SupportedAlgorithms { get; init; }
 
@@ -108,5 +109,12 @@ public sealed record StoredSigningCredential {
 		Claims = this.Claims,
 		CredentialId = this.CredentialId
 	};
+
+	/// <summary>
+	/// Redacts the signing secret from the synthesized record string, so a credential cannot leak its secret
+	/// through logging or string interpolation.
+	/// </summary>
+	public override string ToString() =>
+		$"{nameof(StoredSigningCredential)} {{ CredentialId = {this.CredentialId}, ClientId = {this.ClientId}, ClientName = {this.ClientName}, SigningSecret = [redacted] }}";
 
 }

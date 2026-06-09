@@ -39,6 +39,15 @@ public abstract class DynamicSignedRequestClientResolver(
 	private readonly SignatureValidationOptions _options = options?.Value ?? new SignatureValidationOptions();
 	private readonly ILogger _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
+	// A credential that declares no algorithms is pinned to the v1 default (hmac-sha256) — see the per-credential
+	// algorithm pin in ValidateAsync. An asymmetric credential must opt in via StoredSigningCredential.SupportedAlgorithms.
+	private static readonly IReadOnlySet<string> DefaultAlgorithms =
+		new HashSet<string>(StringComparer.Ordinal) { HmacSha256SignedRequestAlgorithm.Id };
+
+	// Minimum HMAC secret length. 16 bytes = 128-bit security floor; NIST SP 800-107 recommends >= 32 bytes
+	// (the SHA-256 output) for full strength. A shorter secret is treated as a misconfigured, unusable credential.
+	private const int MinimumSecretBytes = 16;
+
 	/// <summary>
 	/// Looks up the active signing credentials for a presenting <c>keyid</c> from the database or external
 	/// source. Return all active credentials (the base class tries each, supporting key rotation), or an empty
@@ -92,8 +101,24 @@ public abstract class DynamicSignedRequestClientResolver(
 				continue;
 			}
 
-			// Per-credential algorithm restriction (null => any registered algorithm is acceptable).
-			if (credential.SupportedAlgorithms is { } allowed && !allowed.Contains(context.Algorithm)) {
+			// Reject a credential whose secret is below the minimum strength — an operator misconfiguration
+			// (empty / trivially short secret) must never produce a verifiable MAC. Fail closed and surface it.
+			if (Encoding.UTF8.GetByteCount(credential.SigningSecret) < MinimumSecretBytes) {
+				if (this._logger.IsEnabled(LogLevel.Warning)) {
+					this._logger.LogWarning(
+						"Signing credential {CredentialId} for keyid {KeyId} has a signing secret shorter than the " +
+						"{Minimum}-byte minimum; skipping it.", credential.CredentialId, context.KeyId, MinimumSecretBytes);
+				}
+
+				continue;
+			}
+
+			// Per-credential algorithm pin. A credential that does not declare its algorithms is pinned to the
+			// v1 default (hmac-sha256), NOT "any registered algorithm" — so adding an asymmetric algorithm later
+			// can never let a request name hmac-sha256 against a key provisioned for asymmetric verification (the
+			// alg-confusion / public-key-as-HMAC-key attack). An asymmetric credential opts in explicitly.
+			var allowedAlgorithms = credential.SupportedAlgorithms is { Count: > 0 } declared ? declared : DefaultAlgorithms;
+			if (!allowedAlgorithms.Contains(context.Algorithm)) {
 				continue;
 			}
 
