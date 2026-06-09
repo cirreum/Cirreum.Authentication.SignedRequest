@@ -1,7 +1,7 @@
 namespace Cirreum.Authentication.SignedRequest.Tests;
 
 using Cirreum.Authentication.Configuration;
-using Cirreum.AuthenticationProvider.SignedRequest;
+using Cirreum.SignedRequest;
 using Cirreum.Coordination;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;

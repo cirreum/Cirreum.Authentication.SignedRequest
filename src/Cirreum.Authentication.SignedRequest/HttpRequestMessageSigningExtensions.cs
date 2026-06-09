@@ -1,7 +1,7 @@
 namespace System.Net.Http;
 
 using Cirreum.Authentication.SignedRequest;
-using Cirreum.AuthenticationProvider.SignedRequest;
+using Cirreum.SignedRequest;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;

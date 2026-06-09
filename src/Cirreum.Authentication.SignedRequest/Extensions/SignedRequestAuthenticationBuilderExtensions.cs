@@ -3,7 +3,7 @@ namespace Cirreum.Authentication;
 using Cirreum.Authentication.Configuration;
 using Cirreum.Authentication.SignedRequest;
 using Cirreum.AuthenticationProvider;
-using Cirreum.AuthenticationProvider.SignedRequest;
+using Cirreum.SignedRequest;
 using Cirreum.Coordination;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.DependencyInjection;

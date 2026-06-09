@@ -1,6 +1,6 @@
 namespace Cirreum.Authentication.SignedRequest;
 
-using Cirreum.AuthenticationProvider.SignedRequest;
+using Cirreum.SignedRequest;
 using System.Text.Json;
 
 /// <summary>

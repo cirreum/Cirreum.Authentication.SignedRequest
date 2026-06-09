@@ -1,7 +1,7 @@
 namespace Cirreum.Authentication.SignedRequest;
 
 using Cirreum.Authentication.Configuration;
-using Cirreum.AuthenticationProvider.SignedRequest;
+using Cirreum.SignedRequest;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Text;

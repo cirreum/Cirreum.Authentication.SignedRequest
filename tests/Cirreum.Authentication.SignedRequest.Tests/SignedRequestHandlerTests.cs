@@ -1,7 +1,7 @@
 namespace Cirreum.Authentication.SignedRequest.Tests;
 
 using Cirreum.Authentication.Configuration;
-using Cirreum.AuthenticationProvider.SignedRequest;
+using Cirreum.SignedRequest;
 using Microsoft.AspNetCore.Http;
 using System.Text;
 using Harness = SignedRequestTestHarness;

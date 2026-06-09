@@ -1,6 +1,6 @@
 namespace Cirreum.Authentication.Configuration;
 
-using Cirreum.AuthenticationProvider.SignedRequest;
+using Cirreum.SignedRequest;
 
 /// <summary>
 /// Options for configuring RFC 9421 signed-request validation behavior.
