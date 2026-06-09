@@ -3,7 +3,7 @@
 	<PropertyGroup>
 		<AssemblyName>Cirreum.Authentication.SignedRequest</AssemblyName>
 		<RootNamespace>Cirreum.Authentication.SignedRequest</RootNamespace>
-		<Description>SignedRequest authentication scheme for the Cirreum framework. Successor to Cirreum.Authorization.SignedRequest from the Cirreum 1.0 Foundation Reset, which recognizes Authentication as a first-class security pillar. Validates HMAC-SHA256 (and pluggable future algorithms) signed request envelopes for partner / M2M integrations. Ships the authentication handler, ISchemeSelector, client resolver family, and the version-keyed ISignedRequestAlgorithm resolver that's the prerequisite for RFC 9421 alignment.</Description>
+		<Description>SignedRequest authentication scheme for the Cirreum framework. Verifies RFC 9421 HTTP Message Signatures (HMAC-SHA256, with a pluggable algorithm resolver) and RFC 9530 Content-Digest for partner / M2M integrations, and signs outbound requests. Ships the authentication handler, ISchemeSelector, the dynamic credential resolver, and the strict-nonce replay posture.</Description>
 		<PackageTags>cirreum;authentication;signedrequest;hmac;rfc9421;scheme</PackageTags>
 	</PropertyGroup>
 
