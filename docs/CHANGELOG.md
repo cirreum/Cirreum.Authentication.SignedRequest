@@ -19,11 +19,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — [SemVer](ht
   - `ISignatureValidationEvents` + contexts + `NullSignatureValidationEvents`
   - `SignatureValidationOptions`, `SignatureVersions`, `SignedRequestDefaults`
   - `DynamicSignedRequestClientResolver`
-- **NEW — `ISignedRequestAlgorithm` / `ISignedRequestAlgorithmResolver` (contracts in Cirreum.AuthenticationProvider):**
-  - `HmacSha256SignedRequestAlgorithm` implements the new contract.
-  - `SignedRequestAlgorithmResolver` resolves algorithms by canonical identifier (e.g., `"hmac-sha256"`).
+- **`ISignedRequestAlgorithm` / `ISignedRequestAlgorithmResolver`** — the pluggable signing/verification seam, defined in the dependency-free `Cirreum.SignedRequest` package so the server scheme and the client SDK build against one source of truth:
+  - `HmacSha256SignedRequestAlgorithm` implements the contract (`"hmac-sha256"`).
+  - `SignedRequestAlgorithmResolver` resolves algorithms by canonical identifier.
   - Apps can register additional `ISignedRequestAlgorithm` implementations via DI (Ed25519, future post-quantum).
-  - The legacy `ISignatureAlgorithm` / `ISignatureAlgorithmResolver` surface is kept internal as `ILegacySignatureAlgorithm` / `LegacySignatureAlgorithmResolver` for the migrated validator's interim use; will be removed in 1.1.0 once the validator pipeline migrates to the new contract.
 - **NEW — `SignedRequestAuthenticationSchemeSelector`** implements `ISchemeSelector` with `SchemeCategory.Machine`. Probes inbound requests for the configured signature headers and routes to the SignedRequest scheme.
 - **NEW — `AddSignedRequest<TClientResolver>(...)` composition verb** on `IAuthenticationBuilder`, the app-facing entry point (composed inside `AddAuthentication(...)`; not auto-registered by the umbrella package). **Code-first — no appsettings section or registrar** (in the Cirreum provider model an appsettings section and a registrar are a matched pair, and SignedRequest has no per-instance data):
   - The client resolver is a **required type parameter** — it is the sole source of signing credentials (unlike ApiKey, where a resolver is additive on top of appsettings clients).
