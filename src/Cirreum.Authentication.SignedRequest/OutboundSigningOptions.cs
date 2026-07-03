@@ -9,8 +9,8 @@ using System.Text.Json;
 /// </summary>
 public sealed class OutboundSigningOptions {
 
-	/// <summary>Default signing options.</summary>
-	public static OutboundSigningOptions Default { get; } = new();
+	/// <summary>A fresh default instance (a new object each access, so a caller mutating it can't bleed config into others) (F2).</summary>
+	public static OutboundSigningOptions Default => new();
 
 	/// <summary>Default JSON serializer options (camelCase) for the JSON-body convenience overload.</summary>
 	public static JsonSerializerOptions DefaultJsonOptions { get; } = new() {

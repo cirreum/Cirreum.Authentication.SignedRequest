@@ -44,10 +44,6 @@ public abstract class DynamicSignedRequestClientResolver(
 	private static readonly IReadOnlySet<string> DefaultAlgorithms =
 		new HashSet<string>(StringComparer.Ordinal) { HmacSha256SignedRequestAlgorithm.Id };
 
-	// Minimum HMAC secret length. 16 bytes = 128-bit security floor; NIST SP 800-107 recommends >= 32 bytes
-	// (the SHA-256 output) for full strength. A shorter secret is treated as a misconfigured, unusable credential.
-	private const int MinimumSecretBytes = 16;
-
 	/// <summary>
 	/// Looks up the active signing credentials for a presenting <c>keyid</c> from the database or external
 	/// source. Return all active credentials (the base class tries each, supporting key rotation), or an empty
@@ -103,11 +99,11 @@ public abstract class DynamicSignedRequestClientResolver(
 
 			// Reject a credential whose secret is below the minimum strength — an operator misconfiguration
 			// (empty / trivially short secret) must never produce a verifiable MAC. Fail closed and surface it.
-			if (Encoding.UTF8.GetByteCount(credential.SigningSecret) < MinimumSecretBytes) {
+			if (!SignedRequestSecret.MeetsFloor(credential.SigningSecret)) {
 				if (this._logger.IsEnabled(LogLevel.Warning)) {
 					this._logger.LogWarning(
 						"Signing credential {CredentialId} for keyid {KeyId} has a signing secret shorter than the " +
-						"{Minimum}-byte minimum; skipping it.", credential.CredentialId, context.KeyId, MinimumSecretBytes);
+						"{Minimum}-byte minimum; skipping it.", credential.CredentialId, context.KeyId, SignedRequestSecret.MinimumBytes);
 				}
 
 				continue;
@@ -122,8 +118,16 @@ public abstract class DynamicSignedRequestClientResolver(
 				continue;
 			}
 
-			var tolerance = credential.TimestampTolerance ?? this._options.TimestampTolerance;
-			var futureTolerance = credential.FutureTimestampTolerance ?? this._options.FutureTimestampTolerance;
+			// A per-credential tolerance override is customer-influenced (self-service-registered) and is clamped
+			// to the operator's ceiling, so one credential row cannot widen its replay-acceptance window — and the
+			// strict-nonce coordination-store retention sized from it — without bound (D1). The operator's global
+			// tolerance (used when a credential declares no override) is authoritative and is never clamped.
+			var tolerance = this.ClampOverride(
+				credential.TimestampTolerance, this._options.TimestampTolerance, this._options.MaxTimestampTolerance,
+				context.KeyId, nameof(StoredSigningCredential.TimestampTolerance));
+			var futureTolerance = this.ClampOverride(
+				credential.FutureTimestampTolerance, this._options.FutureTimestampTolerance, this._options.MaxFutureTimestampTolerance,
+				context.KeyId, nameof(StoredSigningCredential.FutureTimestampTolerance));
 
 			if (!ValidateFreshness(context.Created, context.Expires, tolerance, futureTolerance)) {
 				continue;
@@ -137,6 +141,18 @@ public abstract class DynamicSignedRequestClientResolver(
 			}
 
 			if (algorithm.Verify(context.SignatureBase.Span, context.Signature.Span, Encoding.UTF8.GetBytes(credential.SigningSecret))) {
+				// Fail closed on an anomalous identity even though the secret verified: a (self-service-registered)
+				// store row with a blank ClientId/ClientName would mint a principal authorization cannot name (C1).
+				if (string.IsNullOrWhiteSpace(credential.ClientId) || string.IsNullOrWhiteSpace(credential.ClientName)) {
+					if (this._logger.IsEnabled(LogLevel.Warning)) {
+						this._logger.LogWarning(
+							"Signing credential {CredentialId} for keyid {KeyId} verified but has a blank client id/name; " +
+							"skipping it.", credential.CredentialId, context.KeyId);
+					}
+
+					continue;
+				}
+
 				matched = credential;
 				matchedTolerance = tolerance;
 				matchedFutureTolerance = futureTolerance;
@@ -161,6 +177,32 @@ public abstract class DynamicSignedRequestClientResolver(
 		// per-credential override may exceed the global default, so the global value alone would under-cover it.
 		var replayWindow = matchedTolerance + matchedFutureTolerance;
 		return SignedRequestValidationResult.Success(matched.ToClient(), replayWindow);
+	}
+
+	// Process-wide one-shot guard so the per-credential-tolerance clamp advisory logs at most once.
+	private static int _warnedClamp;
+
+	// Returns the operator global when the credential declares no override; otherwise the override clamped to the
+	// configured ceiling (warning once when a clamp actually happens). Bounds a customer-influenced override so it
+	// cannot widen the replay-acceptance window / strict-nonce TTL without limit (D1).
+	private TimeSpan ClampOverride(TimeSpan? credentialOverride, TimeSpan operatorGlobal, TimeSpan ceiling, string keyId, string knob) {
+		if (credentialOverride is not { } value) {
+			return operatorGlobal;
+		}
+
+		if (value <= ceiling) {
+			return value;
+		}
+
+		if (this._logger.IsEnabled(LogLevel.Warning) && Interlocked.CompareExchange(ref _warnedClamp, 1, 0) == 0) {
+			this._logger.LogWarning(
+				"A signed-request credential for keyid {KeyId} declared a {Knob} of {Override} exceeding the configured " +
+				"ceiling {Ceiling}; clamping it. A per-credential tolerance cannot widen the replay-acceptance window " +
+				"(or the strict-nonce nonce TTL) beyond SignatureValidationOptions.Max*. (Logged once.)",
+				keyId, knob, value, ceiling);
+		}
+
+		return ceiling;
 	}
 
 	private static bool ValidateFreshness(long created, long? expires, TimeSpan tolerance, TimeSpan futureTolerance) {

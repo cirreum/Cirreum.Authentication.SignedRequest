@@ -57,6 +57,37 @@ public sealed class DynamicSignedRequestClientResolverTests {
 		result.ReplayWindow.Should().Be(options.TimestampTolerance + options.FutureTimestampTolerance);
 	}
 
+	// --- D1: a per-credential tolerance override is clamped to the operator's ceiling so a single (self-service)
+	//         credential row cannot widen the replay window / strict-nonce TTL without bound. ---
+
+	[Fact]
+	public async Task A_per_credential_tolerance_override_above_the_ceiling_is_clamped_D1() {
+		var credential = SignedRequestTestHarness.Credential() with {
+			TimestampTolerance = TimeSpan.FromMinutes(30), // wants 30 min; default MaxTimestampTolerance is 10 min
+		};
+		// A request 15 minutes old: within the 30-min override, but BEYOND the 10-min ceiling it clamps to.
+		var staleContext = SignedRequestTestHarness.Context(
+			created: DateTimeOffset.UtcNow.AddMinutes(-15).ToUnixTimeSeconds());
+
+		var result = await Resolver([credential]).ValidateAsync(staleContext);
+
+		result.IsSuccess.Should().BeFalse("the 30-min override clamps to the 10-min ceiling, so a 15-min-old request is too old");
+	}
+
+	[Fact]
+	public async Task The_clamped_tolerance_sizes_the_reported_replay_window_D1() {
+		var credential = SignedRequestTestHarness.Credential() with {
+			TimestampTolerance = TimeSpan.FromMinutes(30),       // clamps to MaxTimestampTolerance (10 min)
+			FutureTimestampTolerance = TimeSpan.FromMinutes(20), // clamps to MaxFutureTimestampTolerance (5 min)
+		};
+
+		var result = await Resolver([credential]).ValidateAsync(SignedRequestTestHarness.Context());
+
+		result.IsSuccess.Should().BeTrue();
+		result.ReplayWindow.Should().Be(TimeSpan.FromMinutes(10) + TimeSpan.FromMinutes(5),
+			"the strict-nonce TTL is sized from the clamped window, not the unbounded override");
+	}
+
 	[Fact]
 	public async Task An_unsupported_algorithm_is_rejected_before_any_credential_work() {
 		var result = await Resolver([SignedRequestTestHarness.Credential()])

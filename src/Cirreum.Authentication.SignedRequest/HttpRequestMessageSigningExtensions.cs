@@ -33,6 +33,18 @@ public static class HttpRequestMessageSigningExtensions {
 		ArgumentNullException.ThrowIfNull(request);
 		ArgumentException.ThrowIfNullOrWhiteSpace(keyId);
 		ArgumentException.ThrowIfNullOrWhiteSpace(signingSecret);
+		// Refuse to emit a signature under a sub-floor key — fail fast at the signer rather than ship a weak MAC (E3).
+		SignedRequestSecret.EnsureFloor(signingSecret, nameof(signingSecret));
+
+		// The signer must sign the exact absolute wire path. A relative RequestUri cannot be resolved here (the
+		// HttpClient.BaseAddress prefix is not visible), so a relative target would silently sign an under-bound
+		// @path. SendSignedAsync resolves against BaseAddress first; the request-only SignRequestAsync cannot.
+		if (request.RequestUri is not { IsAbsoluteUri: true }) {
+			throw new InvalidOperationException(
+				"SignRequestAsync requires an absolute RequestUri. A relative URI cannot be resolved to the wire " +
+				"path the server signs over. Use SendSignedAsync (which resolves against HttpClient.BaseAddress) " +
+				"or set an absolute RequestUri before signing.");
+		}
 
 		options ??= OutboundSigningOptions.Default;
 
@@ -43,11 +55,13 @@ public static class HttpRequestMessageSigningExtensions {
 			: await request.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
 		var contentDigest = ContentDigest.Compute(body);
 
-		var (path, query) = GetPathAndQuery(request.RequestUri);
+		// RequestUri is guaranteed absolute by the guard above, so AbsolutePath/Query are already the isolated,
+		// percent-encoded wire components.
+		var uri = request.RequestUri!;
 		var components = SignatureBaseComponents.FromRequest(
 			request.Method.Method,
-			path,
-			query,
+			uri.AbsolutePath,
+			uri.Query,
 			[new KeyValuePair<string, string>(SignatureComponentNames.ContentDigest, contentDigest)]);
 
 		var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -92,7 +106,11 @@ public static class HttpRequestMessageSigningExtensions {
 		CancellationToken cancellationToken = default) {
 
 		ArgumentNullException.ThrowIfNull(client);
+		ArgumentNullException.ThrowIfNull(request);
 
+		// Resolve a relative RequestUri against the client's BaseAddress BEFORE signing, so the signer signs
+		// the SAME absolute wire path HttpClient will actually send.
+		ResolveAgainstBaseAddress(request, client.BaseAddress);
 		await request.SignRequestAsync(keyId, signingSecret, options, cancellationToken).ConfigureAwait(false);
 		return await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
 	}
@@ -127,17 +145,15 @@ public static class HttpRequestMessageSigningExtensions {
 			: throw new NotSupportedException(
 				$"Outbound signing algorithm '{algorithmId}' is not supported (v1 ships hmac-sha256).");
 
-	private static (string Path, string Query) GetPathAndQuery(Uri? uri) {
-		if (uri is null) {
-			return ("/", string.Empty);
+	// Resolve a relative RequestUri against the client's BaseAddress so the signer signs the absolute wire path
+	// HttpClient will actually send. A relative URI with no BaseAddress is unsignable and fails fast.
+	private static void ResolveAgainstBaseAddress(HttpRequestMessage request, Uri? baseAddress) {
+		if (request.RequestUri is { IsAbsoluteUri: false } relative) {
+			request.RequestUri = baseAddress is not null
+				? new Uri(baseAddress, relative)
+				: throw new InvalidOperationException(
+					"Cannot sign a request with a relative RequestUri when HttpClient.BaseAddress is not set. " +
+					"Set BaseAddress or use an absolute RequestUri.");
 		}
-
-		if (uri.IsAbsoluteUri) {
-			return (uri.AbsolutePath, uri.Query);
-		}
-
-		var original = uri.OriginalString;
-		var queryIndex = original.IndexOf('?');
-		return queryIndex >= 0 ? (original[..queryIndex], original[queryIndex..]) : (original, string.Empty);
 	}
 }

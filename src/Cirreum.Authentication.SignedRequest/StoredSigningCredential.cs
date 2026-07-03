@@ -38,8 +38,11 @@ public sealed record StoredSigningCredential {
 	/// Gets the signing secret used to compute HMAC signatures.
 	/// </summary>
 	/// <remarks>
-	/// This should be stored encrypted at rest in your database.
-	/// The consuming application is responsible for encryption/decryption.
+	/// Store it encrypted at rest (the consuming application owns encryption/decryption). It must be at least
+	/// <c>SignedRequestSecret.MinimumBytes</c> (16) UTF-8 bytes — a <em>byte</em> floor, not an entropy measure,
+	/// so 128-bit strength requires that many <em>random</em> bytes (NIST SP 800-107 recommends ≥ 32). Provision it
+	/// with <c>SigningSecretGenerator.Generate()</c> rather than a hand-chosen passphrase; a credential whose secret
+	/// is below the floor is skipped at verification (E1).
 	/// </remarks>
 	public required string SigningSecret { get; init; }
 

@@ -24,6 +24,22 @@ public sealed class SignatureValidationOptions {
 	public TimeSpan FutureTimestampTolerance { get; set; } = TimeSpan.FromSeconds(30);
 
 	/// <summary>
+	/// Gets or sets the ceiling on a <em>per-credential</em> <see cref="StoredSigningCredential.TimestampTolerance"/>
+	/// override. Default 10 minutes. A per-credential override wider than this is clamped down (with a one-shot
+	/// warning), so a single (self-service-registered) credential row cannot silently widen its replay-acceptance
+	/// window — and, under strict-nonce, the per-nonce coordination-store retention — without bound. Does NOT clamp
+	/// the operator's global <see cref="TimestampTolerance"/>; that is authoritative.
+	/// </summary>
+	public TimeSpan MaxTimestampTolerance { get; set; } = TimeSpan.FromMinutes(10);
+
+	/// <summary>
+	/// Gets or sets the ceiling on a per-credential <see cref="StoredSigningCredential.FutureTimestampTolerance"/>
+	/// override. Default 5 minutes. Clamps a customer-influenced override only; the operator's global
+	/// <see cref="FutureTimestampTolerance"/> is authoritative.
+	/// </summary>
+	public TimeSpan MaxFutureTimestampTolerance { get; set; } = TimeSpan.FromMinutes(5);
+
+	/// <summary>
 	/// Gets or sets the covered components a signature MUST include; a signature whose <c>Signature-Input</c>
 	/// omits any of these is rejected. Default <c>@method</c>, <c>@path</c>, <c>@query</c>, <c>content-digest</c>
 	/// (host-independent — <c>@authority</c> is intentionally not covered, per ADR-0021).
@@ -57,4 +73,12 @@ public sealed class SignatureValidationOptions {
 	/// supply sufficient entropy, so it enforces a floor.
 	/// </summary>
 	public int MinimumNonceLength { get; set; } = 22;
+
+	/// <summary>
+	/// The maximum request-body size (bytes) the handler will buffer to verify <c>Content-Digest</c>. A request
+	/// whose <c>Content-Length</c> exceeds this is rejected before the body is buffered (H2). Default 1 MiB —
+	/// sized for service-to-service / webhook payloads; raise it for larger signed bodies. The body is only read
+	/// after the signature verifies, so this bounds an authenticated client's amplification, not an anonymous one.
+	/// </summary>
+	public long MaxSignedBodyBytes { get; set; } = 1024 * 1024;
 }

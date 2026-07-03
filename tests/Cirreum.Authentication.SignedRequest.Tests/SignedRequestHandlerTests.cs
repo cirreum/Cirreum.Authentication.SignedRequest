@@ -160,7 +160,8 @@ public sealed class SignedRequestHandlerTests {
 			Harness.Sign(), options, Harness.ResolverReturning(Harness.Success(effectiveWindow)), Harness.With(guard));
 
 		result.Succeeded.Should().BeTrue();
-		guard.CapturedTtl.Should().Be(effectiveWindow);
+		// The TTL is the effective per-credential window plus the +1s boundary margin (D2).
+		guard.CapturedTtl.Should().Be(effectiveWindow + TimeSpan.FromSeconds(1));
 		guard.CapturedTtl.Should().NotBe(options.TimestampTolerance + options.FutureTimestampTolerance);
 	}
 
@@ -177,7 +178,8 @@ public sealed class SignedRequestHandlerTests {
 			Harness.Sign(), options, Harness.ResolverReturning(Harness.Success(replayWindow: null)), Harness.With(guard));
 
 		result.Succeeded.Should().BeTrue();
-		guard.CapturedTtl.Should().Be(options.TimestampTolerance + options.FutureTimestampTolerance);
+		// Fallback to the global tolerances, plus the +1s boundary margin (D2).
+		guard.CapturedTtl.Should().Be(options.TimestampTolerance + options.FutureTimestampTolerance + TimeSpan.FromSeconds(1));
 	}
 
 	[Fact]
@@ -235,6 +237,34 @@ public sealed class SignedRequestHandlerTests {
 
 		result.Succeeded.Should().BeFalse();
 		(await CapturedFailureAsync(events)).Should().Be(SignatureFailureType.WeakNonce);
+	}
+
+	// --- H1: a body the signature does not bind is rejected even when content-digest is not a required component. ---
+
+	[Fact]
+	public async Task A_body_the_signature_does_not_bind_is_rejected_H1() {
+		// Operator dropped content-digest from the required set; the signer covers only method/path/query but the
+		// request still carries a body. The body is unauthenticated, so the handler must fail closed (H1).
+		var options = new SignatureValidationOptions { RequiredCoveredComponents = ["@method", "@path", "@query"] };
+		var message = Harness.Sign(
+			covered: ["@method", "@path", "@query"], body: Encoding.UTF8.GetBytes("{\"x\":1}"), nonce: null);
+		var resolver = new Harness.RealResolver([Harness.Credential()]);
+
+		var (result, events) = await Harness.RunAsync(message, options, resolver, Harness.Empty());
+
+		result.Succeeded.Should().BeFalse("a body the signature does not bind must be rejected even when content-digest is not required");
+		(await CapturedFailureAsync(events)).Should().Be(SignatureFailureType.ContentDigestMismatch);
+	}
+
+	[Fact]
+	public async Task A_body_larger_than_the_cap_is_rejected_H2() {
+		var options = new SignatureValidationOptions { MaxSignedBodyBytes = 8 };
+		var message = Harness.Sign(body: Encoding.UTF8.GetBytes("0123456789"), nonce: null); // 10 bytes > 8-byte cap
+		var resolver = new Harness.RealResolver([Harness.Credential()]);
+
+		var (result, _) = await Harness.RunAsync(message, options, resolver, Harness.Empty());
+
+		result.Succeeded.Should().BeFalse("a Content-Length over MaxSignedBodyBytes is refused before buffering");
 	}
 
 }

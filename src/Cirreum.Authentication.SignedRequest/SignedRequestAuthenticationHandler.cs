@@ -118,15 +118,38 @@ public class SignedRequestAuthenticationHandler(
 
 		var client = result.Client;
 
+		// Fail closed on an anomalous identity: a verified signature proves the SECRET, not that the resolved
+		// subject is meaningful. A (self-service-registered) credential row with a blank ClientId/ClientName
+		// would otherwise mint a principal with an empty NameIdentifier that authorization cannot name (C1).
+		if (string.IsNullOrWhiteSpace(client.ClientId) || string.IsNullOrWhiteSpace(client.ClientName)) {
+			return await this.FailAsync(entry.KeyId, SignatureFailureType.Other,
+				"Resolved signing credential has a blank client id or name", error: true);
+		}
+
 		// Content-Digest binds the body (RFC 9530): the signature proved the digest STRING; now prove that string
-		// matches the actual body. Required on every method — a bodyless request signs the empty-body digest.
-		if (entry.CoveredComponents.Contains(SignatureComponentNames.ContentDigest)) {
-			var digestHeader = this.GetHeader(SignedRequestDefaults.ContentDigestHeader);
-			var body = await this.ReadBodyAsync();
+		// matches the actual body. And if the signature does NOT cover content-digest yet the request carries a
+		// body (or a Content-Digest header the signer chose not to bind), that body is unauthenticated and
+		// swappable — fail closed regardless of RequiredCoveredComponents (H1), so dropping content-digest from
+		// the required set can only relax a genuinely bodyless surface, never silently unbind a body.
+		var coversDigest = entry.CoveredComponents.Contains(SignatureComponentNames.ContentDigest);
+		var digestHeader = this.GetHeader(SignedRequestDefaults.ContentDigestHeader);
+
+		// Bound the body buffered to verify the digest (H2). The signature has already verified, so this caps an
+		// authenticated client's memory amplification; a Content-Length over the cap is refused before buffering.
+		if (this.Request.ContentLength is { } contentLength && contentLength > this._validationOptions.MaxSignedBodyBytes) {
+			return await this.FailAsync(entry.KeyId, SignatureFailureType.Other,
+				"Request body exceeds the maximum signed body size", warn: true);
+		}
+
+		var body = await this.ReadBodyAsync();
+		if (coversDigest) {
 			if (!ContentDigest.Verify(digestHeader, body)) {
 				return await this.FailAsync(entry.KeyId, SignatureFailureType.ContentDigestMismatch,
 					"Content-Digest does not match the request body");
 			}
+		} else if (body.Length > 0 || digestHeader is not null) {
+			return await this.FailAsync(entry.KeyId, SignatureFailureType.ContentDigestMismatch,
+				"Request carries a body the signature does not bind (content-digest is not a covered component)", warn: true);
 		}
 
 		// Strict-nonce replay protection (ADR-0021): claim the RFC 9421 nonce now the signature is proven valid.
@@ -158,9 +181,15 @@ public class SignedRequestAuthenticationHandler(
 	/// <inheritdoc/>
 	protected override Task HandleChallengeAsync(AuthenticationProperties properties) {
 		this.Response.StatusCode = 401;
-		this.Response.Headers.WWWAuthenticate = $"SignedRequest realm=\"{this.Scheme.Name}\"";
+		// Deliberately uniform: one stable realm, no per-cause `error` parameter. RFC 9421 defines no standard
+		// WWW-Authenticate vocabulary for HTTP Message Signatures, and an undifferentiated challenge denies an
+		// attacker a probing oracle (unknown-keyid vs bad-signature). The realm is a fixed constant rather than
+		// the deployment-specific scheme name (H3); precise failure categories are on ISignatureValidationEvents.
+		this.Response.Headers.WWWAuthenticate = $"SignedRequest realm=\"{ChallengeRealm}\"";
 		return Task.CompletedTask;
 	}
+
+	private const string ChallengeRealm = "SignedRequest";
 
 	/// <inheritdoc/>
 	protected override Task HandleForbiddenAsync(AuthenticationProperties properties) {
@@ -210,8 +239,9 @@ public class SignedRequestAuthenticationHandler(
 				nameof(ISignedRequestClientResolver));
 		}
 
-		var ttl = replayWindow
-			?? (this._validationOptions.TimestampTolerance + this._validationOptions.FutureTimestampTolerance);
+		var ttl = (replayWindow
+			?? (this._validationOptions.TimestampTolerance + this._validationOptions.FutureTimestampTolerance))
+			+ TimeSpan.FromSeconds(1); // +1s closes the sub-second slit at the boundary from second-rounded `created` (D2).
 
 		bool claimed;
 		try {
@@ -241,6 +271,21 @@ public class SignedRequestAuthenticationHandler(
 		return AuthenticateResult.Fail("Replay protection is temporarily unavailable");
 	}
 
+	/// <summary>
+	/// Claim types the handler emits itself from the resolved client's first-class fields. A store-supplied
+	/// custom claim for one of these is dropped (with a warning) so a (self-service-registered) credential row
+	/// cannot shadow identity, role, the credential-type marker, the scheme, or the credential id that an
+	/// authorization policy relies on — the same A7/M-2 reserved-claim guard ApiKey and SessionTicket carry (C2).
+	/// </summary>
+	private static readonly HashSet<string> ReservedClaimTypes = new(StringComparer.OrdinalIgnoreCase) {
+		ClaimTypes.NameIdentifier,
+		ClaimTypes.Name,
+		ClaimTypes.Role,
+		"client_type",
+		"auth_scheme",
+		"credential_id",
+	};
+
 	private AuthenticationTicket BuildTicket(SignedRequestClient client) {
 		var claims = new List<Claim> {
 			new(ClaimTypes.NameIdentifier, client.ClientId),
@@ -253,18 +298,61 @@ public class SignedRequestAuthenticationHandler(
 			claims.Add(new Claim("credential_id", client.CredentialId));
 		}
 
-		foreach (var role in client.Roles) {
-			claims.Add(new Claim(ClaimTypes.Role, role));
+		// Roles from a (self-service / semi-trusted) store are de-duplicated and screened for control characters
+		// before projection, so a malformed/hostile credential row can neither bloat the principal with repeats
+		// nor smuggle CR/LF into a downstream sink that re-emits a claim value (C3/N13, RFC 9110 §5.5).
+		foreach (var role in client.Roles.Distinct(StringComparer.Ordinal)) {
+			if (IsSafeClaimValue(role)) {
+				claims.Add(new Claim(ClaimTypes.Role, role));
+			} else {
+				this.WarnUnsafeClaim(client.ClientId, ClaimTypes.Role);
+			}
 		}
 
 		if (client.Claims is not null) {
 			foreach (var (claimType, claimValue) in client.Claims) {
+				if (ReservedClaimTypes.Contains(claimType)) {
+					// A store-supplied custom claim must never shadow a framework claim the handler emits —
+					// dropping it keeps identity / role / client_type / auth_scheme / credential_id authoritative.
+					if (this.Logger.IsEnabled(LogLevel.Warning)) {
+						this.Logger.LogWarning(
+							"Signed-request client {ClientId} declared a reserved claim '{ClaimType}'; ignoring it.",
+							client.ClientId, claimType);
+					}
+					continue;
+				}
+				if (!IsSafeClaimValue(claimValue)) {
+					this.WarnUnsafeClaim(client.ClientId, claimType);
+					continue;
+				}
 				claims.Add(new Claim(claimType, claimValue));
 			}
 		}
 
 		var identity = new ClaimsIdentity(claims, this.Scheme.Name);
 		return new AuthenticationTicket(new ClaimsPrincipal(identity), this.Scheme.Name);
+	}
+
+	// Whether a claim value is safe to project — rejecting C0/C1 control characters (CR/LF/NUL/…) that could
+	// corrupt a downstream sink re-emitting it (audit record, header echo, non-structured log). RFC 9110 §5.5.
+	private static bool IsSafeClaimValue(string? value) {
+		if (string.IsNullOrEmpty(value)) {
+			return true;
+		}
+		foreach (var c in value) {
+			if (char.IsControl(c)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private void WarnUnsafeClaim(string clientId, string claimType) {
+		if (this.Logger.IsEnabled(LogLevel.Warning)) {
+			this.Logger.LogWarning(
+				"Signed-request client {ClientId} supplied claim '{ClaimType}' with an unsafe (control-character) value; dropping it.",
+				clientId, claimType);
+		}
 	}
 
 	// Collects the covered HTTP field values from the request (derived '@' components are not fields). A covered
