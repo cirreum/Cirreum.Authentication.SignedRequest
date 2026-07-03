@@ -1,5 +1,6 @@
 namespace Cirreum.Authentication.Configuration;
 
+using Cirreum.Authentication.SignedRequest;
 using Cirreum.SignedRequest;
 
 /// <summary>
