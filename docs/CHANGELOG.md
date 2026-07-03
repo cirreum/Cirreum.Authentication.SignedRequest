@@ -32,4 +32,4 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — [SemVer](ht
 
 ### Migration
 
-Apps consuming `Cirreum.Authorization.SignedRequest` migrate by installing `Cirreum.Authentication.SignedRequest` and switching their composition root from `AddAuthorization(authz => authz.AddSignedRequest<MyResolver>(...))` to `AddAuthentication(auth => auth.AddSignedRequest<MyResolver>(...))`. See [`docs/MIGRATION-v1.md`](MIGRATION-v1.md).
+Apps consuming `Cirreum.Authorization.SignedRequest` migrate by installing `Cirreum.Authentication.SignedRequest` and switching their composition root from `AddAuthorization(authz => authz.AddSignedRequest<MyResolver>(...))` to `AddAuthentication(auth => auth.AddSignedRequest<MyResolver>(...))`. **This is a breaking protocol change, not just a rename** — the wire format is now RFC 9421 / RFC 9530 (the legacy `X-Client-Id` / `X-Timestamp` / `X-Signature` custom-header envelope is gone), so the signer and verifier must upgrade together. See [`docs/MIGRATION-v1.md`](MIGRATION-v1.md).

@@ -1,50 +1,74 @@
-# Cirreum.Authentication.SignedRequest 1.0.0 — Renamed home for the SignedRequest scheme
+# Cirreum.Authentication.SignedRequest 1.0.0 — the RFC 9421 server scheme
+
+The server-side SignedRequest authentication scheme: **verifies** inbound RFC 9421 HTTP Message
+Signatures (RFC 9530 `Content-Digest`) and can **sign** outbound requests / webhooks. Successor to
+the deprecated `Cirreum.Authorization.SignedRequest`, re-homed under the Authentication pillar and
+re-designed to a genuine RFC 9421 / 9530 wire format.
+
+> **Breaking migration.** This is not a drop-in rename — the wire format changed from the legacy
+> custom-header envelope to RFC 9421. Signer and verifier must upgrade together. See
+> [`MIGRATION-v1.md`](MIGRATION-v1.md).
 
 ## Why this release exists
 
-`Cirreum.Authorization.SignedRequest` validates HMAC-SHA256 signed request envelopes to authenticate partner/M2M callers — but its package name placed it in the Authorization pillar. The **Cirreum 1.0 Foundation Reset** corrects this by recognizing Authentication as a first-class security pillar and moving the scheme packages to their proper home.
-
-This release is the rename + the foundation for future RFC 9421 HTTP Message Signatures alignment.
+`Cirreum.Authorization.SignedRequest` authenticated partner / M2M callers, but (1) its name placed it
+in the Authorization pillar when signing proves *identity*, and (2) it used a bespoke custom-header
+envelope. The Cirreum 1.0 Foundation Reset corrects both: the scheme moves to the Authentication
+pillar and adopts standard RFC 9421 HTTP Message Signatures + RFC 9530 Content-Digest, sharing one
+signature-base implementation with the client SDK so signer and verifier cannot drift.
 
 ## What's new
 
-### Version-pluggable crypto
+### RFC 9421 / RFC 9530 verification
 
-The new `ISignedRequestAlgorithm` + `ISignedRequestAlgorithmResolver` contracts (in `Cirreum.AuthenticationProvider`) replace the legacy fixed-algorithm switch. Apps register algorithms additively via DI:
+Inbound requests carry `Signature` / `Signature-Input` (signed `@method` / `@path` / `@query` /
+`content-digest` with `created` / `expires` / `nonce` / `keyid` / `tag` parameters) and a
+`Content-Digest` header — **no custom `X-*` headers**. The credential is identified by `keyid`. The
+signature is verified before the body is read; freshness (`created` / `expires`) is bounded; the body
+is bound via Content-Digest.
+
+### Code-first composition
 
 ```csharp
-public interface ISignedRequestAlgorithm {
-    string AlgorithmId { get; }
-    bool Verify(ReadOnlySpan<byte> canonicalInput, ReadOnlySpan<byte> signature, ReadOnlySpan<byte> keyMaterial);
-    byte[] Sign(ReadOnlySpan<byte> canonicalInput, ReadOnlySpan<byte> keyMaterial);
-}
+builder.AddAuthentication(auth => {
+    auth.AddSignedRequest<MyCredentialResolver>(o => o.ConfigureValidation(v => {
+        v.RequireStrictNonce = true;
+        v.TimestampTolerance = TimeSpan.FromMinutes(2);
+    }));
+    auth.AddCoordination(c => c.UseInMemory());   // strict-nonce backend (or .UseRedis())
+});
 ```
 
-`HmacSha256SignedRequestAlgorithm` implements the new contract for the existing HMAC-SHA256 algorithm. Apps adding Ed25519, future post-quantum algorithms, etc. register additional implementations without modifying framework code.
+`AddSignedRequest<TClientResolver>(...)` — no appsettings section; the resolver is the sole source of
+signing credentials (implement `DynamicSignedRequestClientResolver`, keyed by `keyid`, for zero-downtime
+rotation).
+
+### Pluggable algorithm seam
+
+`ISignedRequestAlgorithm` / `ISignedRequestAlgorithmResolver` live in the dependency-free
+`Cirreum.SignedRequest` package (shared with the client SDK), with `HmacSha256SignedRequestAlgorithm`
+built in. Asymmetric algorithms (Ed25519, future PQ) register additively without touching the signature
+base or wire format.
+
+### Strict-nonce replay protection
+
+`RequireStrictNonce` claims each `nonce` through `IReplayGuard` (from `Cirreum.Coordination`), held for
+the credential's effective freshness window — true single-use protection over a shared backend.
 
 ### Selector-based dispatch
 
-`SignedRequestAuthenticationSchemeSelector` implements `ISchemeSelector` with `SchemeCategory.Machine`. The dynamic forward resolver picks the SignedRequest scheme when configured signature headers are present.
-
-## How it pairs with the rest of the Authentication pillar
-
-| Package | Role |
-|---|---|
-| `Cirreum.Kernel` | Versioned-message primitive, `INotification` markers, auth event bus, `AuthenticationContextKeys` |
-| `Cirreum.AuthenticationProvider` | Registrar bases, `ISchemeSelector`, `ISignedRequestAlgorithm`, `SchemeCategory` |
-| **`Cirreum.Authentication.SignedRequest`** *(this release)* | SignedRequest scheme handler + signature validator + algorithm registry + selector |
-| `Cirreum.Authentication.SignedRequest.Client` | Companion outbound-signing client package |
-| `Cirreum.Runtime.AuthenticationProvider` | Dynamic forward resolver, selector iteration |
-| `Cirreum.Runtime.Authentication` | App-facing `AddAuthentication(...)` builder |
+`SignedRequestAuthenticationSchemeSelector` (`ISchemeSelector`, `SchemeCategory.Machine`) routes inbound
+requests carrying the signature headers to this scheme.
 
 ## Compatibility
 
-- **.NET 10.0** target.
-- **Cirreum.Providers 1.2.0+** required.
-- **Cirreum.AuthenticationProvider 1.0.0+** required.
-- Apps migrating from `Cirreum.Authorization.SignedRequest` follow [`MIGRATION-v1.md`](MIGRATION-v1.md).
-- Existing HMAC-SHA256 signed requests continue to validate without on-the-wire changes.
+- **.NET 10.0**; `FrameworkReference Microsoft.AspNetCore.App`.
+- **Breaking successor** to `Cirreum.Authorization.SignedRequest` — the wire format changed; follow
+  [`MIGRATION-v1.md`](MIGRATION-v1.md) and cut signer + verifier over together.
+- Depends on `Cirreum.AuthenticationProvider 1.1.0`, `Cirreum.SignedRequest 1.0.0`, `Cirreum.Coordination 1.0.0`.
 
 ## See also
 
+- `Cirreum.SignedRequest` — the shared RFC 9421 / 9530 primitives + signer
+- `Cirreum.Authentication.SignedRequest.Client` — the outbound-signing + webhook-validation SDK
 - [`MIGRATION-v1.md`](MIGRATION-v1.md), [`CHANGELOG.md`](CHANGELOG.md)
