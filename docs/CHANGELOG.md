@@ -8,6 +8,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — [SemVer](ht
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-03
+
 ### Added
 
 - Initial release. Cirreum.Authentication.SignedRequest is the SignedRequest authentication scheme of the Cirreum framework, established as part of the **Cirreum 1.0 Foundation Reset** wave.
