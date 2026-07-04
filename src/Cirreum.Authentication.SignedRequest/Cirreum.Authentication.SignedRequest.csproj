@@ -9,7 +9,7 @@
 
 	<ItemGroup>
 		<!-- Cirreum.Result + Cirreum.Providers (+ Kernel/Contracts) flow in transitively via Cirreum.AuthenticationProvider. -->
-		<PackageReference Include="Cirreum.AuthenticationProvider" Version="1.1.0" />
+		<PackageReference Include="Cirreum.AuthenticationProvider" Version="1.1.1" />
 
 		<!-- Shared RFC 9421 / RFC 9530 primitives (signature-base builder, wire parser, Content-Digest, algorithm seam),
 		     consumed identically by the .Client SDK so signer and verifier cannot drift (ADR-0021 §8). -->
