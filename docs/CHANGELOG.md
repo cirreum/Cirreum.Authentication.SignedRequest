@@ -8,6 +8,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — [SemVer](ht
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-07-27
+
 ### Fixed
 
 - **A signing credential declaring a blank `Audience` is now refused with a diagnostic instead of
