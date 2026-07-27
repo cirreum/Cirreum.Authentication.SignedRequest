@@ -8,6 +8,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — [SemVer](ht
 
 ## [Unreleased]
 
+### Fixed
+
+- **A signing credential declaring a blank `Audience` is now refused with a diagnostic instead of
+  silently never matching.** `null` is the sentinel for "no explicit audience binding", so `""` said
+  the credential *was* bound while naming nothing to bind to — and the comparison then matched only
+  a request carrying an explicitly empty `tag`, which no ordinary caller sends. The credential
+  rejected everyone, surfacing as an unexplained signature failure. The operator now gets a warning
+  naming the credential and the fix.
+
 ## [1.0.7] - 2026-07-24
 
 ### Updated

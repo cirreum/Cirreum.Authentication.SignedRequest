@@ -135,9 +135,27 @@ public abstract class DynamicSignedRequestClientResolver(
 
 			// Audience: a credential bound to an explicit audience requires the matching tag (the shared-credential
 			// defense). When null the keyid is the implicit audience and no tag is required.
-			if (credential.Audience is { } audience && !string.Equals(audience, context.Tag, StringComparison.Ordinal)) {
-				audienceMismatch = true;
-				continue;
+			// A blank-but-present Audience is a misconfiguration, not a binding to the empty string:
+			// null is the sentinel for "no explicit audience", so `""` says the credential IS bound
+			// while naming nothing to bind to. Left alone it matches only a request carrying an
+			// explicitly empty tag, so the credential rejects every ordinary caller — a silent
+			// outage that reads as a signature problem. Refuse it where the operator can see it.
+			if (credential.Audience is { } audience) {
+				if (string.IsNullOrWhiteSpace(audience)) {
+					if (this._logger.IsEnabled(LogLevel.Warning)) {
+						this._logger.LogWarning(
+							"Signing credential {CredentialId} for keyid {KeyId} declares a blank Audience. Leave it " +
+							"null for no audience binding, or set the audience it is bound to; a blank value binds the " +
+							"credential to nothing and can never match.",
+							credential.CredentialId, context.KeyId);
+					}
+					continue;
+				}
+
+				if (!string.Equals(audience, context.Tag, StringComparison.Ordinal)) {
+					audienceMismatch = true;
+					continue;
+				}
 			}
 
 			if (algorithm.Verify(context.SignatureBase.Span, context.Signature.Span, Encoding.UTF8.GetBytes(credential.SigningSecret))) {
