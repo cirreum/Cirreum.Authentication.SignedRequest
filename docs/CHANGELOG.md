@@ -8,6 +8,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — [SemVer](ht
 
 ## [Unreleased]
 
+### Added
+
+- **Declares `SubjectKind.Machine`.** RFC 9421 message signatures authenticate a calling service
+  by key pair, with no human subject. Contributed from `AddSignedRequest<T>(...)` rather than a
+  registrar base, since this scheme composes through its verb and has no configured instances to
+  register from.
+
+### Updated
+
+- Updated NuGet packages.
+
 ## [1.0.11] - 2026-08-04
 
 ### Updated

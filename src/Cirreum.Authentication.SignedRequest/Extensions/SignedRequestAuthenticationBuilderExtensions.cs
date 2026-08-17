@@ -5,6 +5,7 @@ using Cirreum.Authentication.SignedRequest;
 using Cirreum.AuthenticationProvider;
 using Cirreum.SignedRequest;
 using Cirreum.Coordination;
+using Cirreum.Security;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -96,6 +97,16 @@ public static class SignedRequestAuthenticationBuilderExtensions {
 		services.AddSingleton(new SignedRequestAuthenticationSchemeSelector(schemeName));
 		services.AddSingleton<ISchemeSelector>(sp =>
 			sp.GetRequiredService<SignedRequestAuthenticationSchemeSelector>());
+
+		// Declare what this scheme authenticates. Contributed here rather than from a registrar
+		// base, because this scheme composes through this verb and has no configured instances to
+		// register from. Claim authority stays Unspecified for the same reason — there is no
+		// instance settings block for an application to declare it in, so existing behaviour holds.
+		services.AddSingleton(new SchemeClaimAuthorityRegistration(
+			schemeName,
+			SubjectKind.Machine,
+			ClaimAuthority.Unspecified,
+			ClaimAuthority.Unspecified));
 
 		return builder;
 	}
