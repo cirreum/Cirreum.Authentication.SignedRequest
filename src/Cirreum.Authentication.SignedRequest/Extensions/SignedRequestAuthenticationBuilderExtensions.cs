@@ -89,24 +89,16 @@ public static class SignedRequestAuthenticationBuilderExtensions {
 		services.TryAddScoped<TClientResolver>();
 		services.TryAddScoped<ISignedRequestClientResolver>(sp => sp.GetRequiredService<TClientResolver>());
 
-		// Single scheme + selector.
+		// Single scheme + selector — registered and declared through the builder. Claim
+		// authority stays Unspecified: this scheme composes through this verb and has no
+		// instance settings block for an application to declare it in.
 		var schemeName = SignedRequestSchemes.Default;
-		builder.AuthBuilder.AddScheme<SignedRequestAuthenticationOptions, SignedRequestAuthenticationHandler>(
+		builder.AddScheme<SignedRequestAuthenticationOptions, SignedRequestAuthenticationHandler>(
 			schemeName,
-			_ => { });
+			SubjectKind.Machine);
 		services.AddSingleton(new SignedRequestAuthenticationSchemeSelector(schemeName));
 		services.AddSingleton<ISchemeSelector>(sp =>
 			sp.GetRequiredService<SignedRequestAuthenticationSchemeSelector>());
-
-		// Declare what this scheme authenticates. Contributed here rather than from a registrar
-		// base, because this scheme composes through this verb and has no configured instances to
-		// register from. Claim authority stays Unspecified for the same reason — there is no
-		// instance settings block for an application to declare it in, so existing behaviour holds.
-		services.AddSingleton(new SchemeClaimAuthorityRegistration(
-			schemeName,
-			SubjectKind.Machine,
-			ClaimAuthority.Unspecified,
-			ClaimAuthority.Unspecified));
 
 		return builder;
 	}
